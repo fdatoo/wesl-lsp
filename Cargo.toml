@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/wesl-analysis",
+    "crates/wesl-fmt",
+    "crates/wesl-lsp",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/fdatoo/wesl-lsp"
+rust-version = "1.96"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+crossbeam-channel = "0.5.15"
+env_logger = "0.11.8"
+log = "0.4.27"
+lsp-server = "0.7.9"
+lsp-types = "0.95.1"
+rustc-hash = "2.1.1"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+smol_str = "0.3.2"
+walkdir = "2.5.0"
+wesl = { git = "https://github.com/fdatoo/wesl-rs", rev = "18fecf2b5d79fcf2b36201757a24b6392116a8e7", features = ["eval"] }
+wgsl-parse = { git = "https://github.com/fdatoo/wesl-rs", rev = "18fecf2b5d79fcf2b36201757a24b6392116a8e7", features = ["wesl"] }
+wgsl-types = { git = "https://github.com/fdatoo/wesl-rs", rev = "18fecf2b5d79fcf2b36201757a24b6392116a8e7" }

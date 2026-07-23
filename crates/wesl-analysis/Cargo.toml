@@ -1,0 +1,20 @@
+[package]
+name = "wesl-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+log.workspace = true
+rustc-hash.workspace = true
+smol_str.workspace = true
+walkdir.workspace = true
+wesl.workspace = true
+wgsl-parse.workspace = true
+wgsl-types.workspace = true
+
+[dev-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in"] }
+tempfile = "3.20.0"

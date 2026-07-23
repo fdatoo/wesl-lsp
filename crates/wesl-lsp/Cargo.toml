@@ -1,0 +1,23 @@
+[package]
+name = "wesl-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "wesl-lsp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+env_logger.workspace = true
+log.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wesl-analysis = { path = "../wesl-analysis" }
+wesl-fmt = { path = "../wesl-fmt" }

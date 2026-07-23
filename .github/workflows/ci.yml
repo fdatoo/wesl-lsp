@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Fetch pinned shader corpora
+        run: cargo run -p xtask -- fetch-corpus
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Test private-corpus gate in skip mode
+        run: cargo test -p wesl-analysis --test private_corpus --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
