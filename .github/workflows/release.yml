@@ -53,6 +53,16 @@ jobs:
         with:
           name: wesl-lsp-${{ github.ref_name }}-${{ matrix.target }}
           path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wesl-lsp-${{ github.ref_name }}-*
+          path: dist
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
