@@ -9,13 +9,12 @@ use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    ConfigurationItem, ConfigurationParams, Diagnostic as LspDiagnostic, DiagnosticOptions,
-    DiagnosticRelatedInformation, DiagnosticServerCapabilities,
-    DiagnosticSeverity as LspDiagnosticSeverity, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InsertTextFormat,
+    ConfigurationItem, ConfigurationParams, Diagnostic as LspDiagnostic,
+    DiagnosticRelatedInformation, DiagnosticSeverity as LspDiagnosticSeverity,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InsertTextFormat,
     Location as LspLocation, MarkupContent, MarkupKind, OneOf, Position as LspPosition,
     PublishDiagnosticsParams, Range as LspRange, ReferenceParams, RenameOptions, RenameParams,
     ServerCapabilities, SymbolKind as LspSymbolKind, TextDocumentSyncCapability,
@@ -170,12 +169,6 @@ fn capabilities() -> ServerCapabilities {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions::default()),
         document_formatting_provider: Some(OneOf::Left(true)),
-        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
-            identifier: Some("wesl-lsp".into()),
-            inter_file_dependencies: true,
-            workspace_diagnostics: false,
-            work_done_progress_options: WorkDoneProgressOptions::default(),
-        })),
         ..ServerCapabilities::default()
     }
 }

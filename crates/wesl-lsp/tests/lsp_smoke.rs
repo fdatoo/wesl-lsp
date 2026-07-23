@@ -146,7 +146,14 @@ fn requests_workspace_configuration_when_initialization_root_is_absent() {
             "workspaceFolders": [{"uri": workspace_uri, "name": "workspace"}]
         }
     }));
-    assert_eq!(client.receive_response(1)["id"], 1);
+    let initialized = client.receive_response(1);
+    assert_eq!(initialized["id"], 1);
+    assert!(
+        initialized["result"]["capabilities"]
+            .get("diagnosticProvider")
+            .is_none(),
+        "push-only server must not advertise pull diagnostics"
+    );
     client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
     let configuration = client.receive();
     assert_eq!(configuration["method"], "workspace/configuration");
