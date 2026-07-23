@@ -33,14 +33,15 @@ pub(crate) fn preprocess(source: &str) -> String {
 
     let mut cursor = 0;
     while cursor + 2 < bytes.len() {
-        if bytes[cursor] == b'#' && bytes[cursor + 1] == b'{' {
-            if let Some(relative_end) = bytes[cursor + 2..].iter().position(|byte| *byte == b'}') {
-                let end = cursor + 2 + relative_end + 1;
-                let replacement = equal_length_identifier(end - cursor);
-                bytes[cursor..end].copy_from_slice(replacement.as_bytes());
-                cursor = end;
-                continue;
-            }
+        if bytes[cursor] == b'#'
+            && bytes[cursor + 1] == b'{'
+            && let Some(relative_end) = bytes[cursor + 2..].iter().position(|byte| *byte == b'}')
+        {
+            let end = cursor + 2 + relative_end + 1;
+            let replacement = equal_length_identifier(end - cursor);
+            bytes[cursor..end].copy_from_slice(replacement.as_bytes());
+            cursor = end;
+            continue;
         }
         cursor += 1;
     }

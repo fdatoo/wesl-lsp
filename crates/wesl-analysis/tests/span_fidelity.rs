@@ -232,14 +232,22 @@ impl<'a> SpanProbe<'a> {
     }
 }
 
-fn terrain_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Seclorum/novus/crates/novus-render/shaders/terrain.wesl")
+fn terrain_path() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("WESL_LSP_PRIVATE_CORPUS") {
+        return Some(PathBuf::from(root).join("terrain.wesl"));
+    }
+    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../Seclorum/novus/crates/novus-render/shaders/terrain.wesl");
+    local.exists().then_some(local)
 }
 
 #[test]
 fn terrain_has_faithful_declaration_and_identifier_spans() {
-    let source = fs::read_to_string(terrain_path()).unwrap();
+    let Some(path) = terrain_path() else {
+        eprintln!("skipping private terrain span probe");
+        return;
+    };
+    let source = fs::read_to_string(path).unwrap();
     let module = parse_str(&source).unwrap();
     let mut probe = SpanProbe::new(&source);
 

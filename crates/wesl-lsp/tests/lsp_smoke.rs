@@ -97,6 +97,10 @@ fn position(source: &str, offset: usize) -> Value {
 #[test]
 fn publishes_clean_then_isolated_import_diagnostics() {
     let shader_root = shaders();
+    if !shader_root.is_dir() {
+        eprintln!("skipping private Seclorum LSP smoke test");
+        return;
+    }
     let path = shader_root.join("sky.wesl");
     let source = fs::read_to_string(&path).unwrap();
     let uri = lsp_types::Url::from_file_path(&path).unwrap();
