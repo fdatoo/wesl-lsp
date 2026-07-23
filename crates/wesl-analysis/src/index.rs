@@ -6,18 +6,19 @@ use std::{
     sync::Arc,
 };
 
+use crate::{
+    builtins::{BUILTIN_FUNCTIONS, BUILTIN_TYPES, builtin},
+    dialect,
+    ty::{Ty, TypeDiagnostic, TypeEnvironment, analyze_module, infer_expression_type},
+};
 use smol_str::SmolStr;
 use walkdir::WalkDir;
 use wgsl_parse::{
     SyntaxNode, parse_str,
     syntax::{
-        GlobalDeclaration, ImportContent, ImportItem, ModulePath, PathOrigin, TranslationUnit,
+        CompoundStatement, Expression, GlobalDeclaration, ImportContent, ImportItem, ModulePath,
+        PathOrigin, Statement, StatementNode, TranslationUnit,
     },
-};
-
-use crate::{
-    builtins::{BUILTIN_FUNCTIONS, BUILTIN_TYPES, builtin},
-    dialect,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +93,7 @@ struct ImportBinding {
 #[derive(Clone, Debug)]
 struct FileIndex {
     source: Arc<str>,
+    module: Option<Arc<TranslationUnit>>,
     symbols: Vec<Symbol>,
     locals: Vec<LocalSymbol>,
     imports: Vec<ImportBinding>,
@@ -104,7 +106,7 @@ struct FileIndex {
 struct LocalSymbol {
     name: SmolStr,
     range: Range<usize>,
-    function_range: Range<usize>,
+    scope_range: Range<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -283,7 +285,7 @@ impl PackageIndex {
             .trim_end()
             .ends_with('.')
         {
-            return self.member_completions(file, offset);
+            return self.member_completions(path, file, offset);
         }
 
         let mut completions = Vec::new();
@@ -291,7 +293,7 @@ impl PackageIndex {
         for local in file
             .locals
             .iter()
-            .filter(|local| local.range.start <= offset && local.function_range.contains(&offset))
+            .filter(|local| local.range.start <= offset && local.scope_range.contains(&offset))
         {
             push_completion(
                 &mut completions,
@@ -403,74 +405,137 @@ impl PackageIndex {
         completions
     }
 
-    fn member_completions(&self, file: &FileIndex, offset: usize) -> Vec<Completion> {
+    fn member_completions(&self, path: &Path, file: &FileIndex, offset: usize) -> Vec<Completion> {
         let prefix = file.source[..offset.min(file.source.len())].trim_end();
         let Some(dot) = prefix.len().checked_sub(1) else {
             return Vec::new();
         };
-        let Some(base) = identifier_before(&file.source, dot) else {
+        let Some(base_source) = member_base_source(&file.source, dot) else {
             return Vec::new();
         };
-        let Some(type_name) = declared_type_name(&file.source, &base, dot) else {
+        let Ok(expression) = base_source.parse::<Expression>() else {
             return Vec::new();
         };
-        if let Some(size) = type_name
-            .strip_prefix("vec")
-            .and_then(|size| size.chars().next())
-            .and_then(|size| size.to_digit(10))
-        {
-            let xyzw = ["x", "y", "z", "w"];
-            let rgba = ["r", "g", "b", "a"];
-            let mut labels = Vec::new();
-            for index in 0..size.min(4) as usize {
-                labels.push(xyzw[index]);
-                labels.push(rgba[index]);
+        let Some(module) = file.module.as_deref() else {
+            return Vec::new();
+        };
+        let mut visible = file
+            .locals
+            .iter()
+            .filter(|local| local.range.start <= dot && local.scope_range.contains(&dot))
+            .collect::<Vec<_>>();
+        visible.sort_by_key(|local| local.range.start);
+        let mut local_types = HashMap::new();
+        for local in visible {
+            if let Some(type_name) = declared_type_name(&file.source, local.name.as_str(), dot) {
+                local_types.insert(local.name.to_string(), type_name);
             }
-            if size >= 2 {
-                labels.extend(["xy", "rg"]);
-            }
-            if size >= 3 {
-                labels.extend(["xyz", "rgb"]);
-            }
-            if size >= 4 {
-                labels.extend(["xyzw", "rgba"]);
-            }
-            return labels
+        }
+        let mut active = HashSet::from([path.to_path_buf()]);
+        let imports = self.imported_type_environment(file, &mut active);
+        match infer_expression_type(module, expression, &local_types, imports) {
+            Ty::Vector(size, _) => swizzle_labels(size)
                 .into_iter()
                 .map(|label| Completion {
-                    label: label.to_owned(),
+                    label,
                     kind: CompletionKind::Field,
                     detail: Some("vector swizzle".to_owned()),
                     insert_text: None,
                     additional_edit: None,
                 })
-                .collect();
+                .collect(),
+            Ty::Struct(name, fields) => fields
+                .into_iter()
+                .map(|(label, field_ty)| Completion {
+                    label,
+                    kind: CompletionKind::Field,
+                    detail: Some(format!("{name} field: {field_ty}")),
+                    insert_text: None,
+                    additional_edit: None,
+                })
+                .collect(),
+            _ => Vec::new(),
         }
-        if let Some(structure) = self
+    }
+
+    pub(crate) fn type_diagnostics(
+        &self,
+        path: &Path,
+        module: &TranslationUnit,
+    ) -> Vec<TypeDiagnostic> {
+        let Some(file) = self.files.get(path) else {
+            return crate::check_module(module);
+        };
+        let mut active = HashSet::from([path.to_path_buf()]);
+        let imports = self.imported_type_environment(file, &mut active);
+        analyze_module(module, imports).0
+    }
+
+    fn type_environment(&self, path: &Path, active: &mut HashSet<PathBuf>) -> TypeEnvironment {
+        if !active.insert(path.to_path_buf()) {
+            return TypeEnvironment::default();
+        }
+        let environment = self
             .files
-            .values()
-            .flat_map(|candidate| &candidate.symbols)
-            .find(|symbol| symbol.kind == SymbolKind::Struct && symbol.name.as_str() == type_name)
-        {
-            return structure
-                .children
-                .iter()
-                .map(|field| symbol_completion(field, None))
-                .collect();
-        }
-        self.files
-            .values()
-            .find_map(|candidate| textual_struct_fields(&candidate.source, &type_name))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|label| Completion {
-                label,
-                kind: CompletionKind::Field,
-                detail: Some(format!("{type_name} field")),
-                insert_text: None,
-                additional_edit: None,
+            .get(path)
+            .and_then(|file| {
+                let module = file.module.as_deref()?;
+                let imports = self.imported_type_environment(file, active);
+                Some(analyze_module(module, imports).1)
             })
-            .collect()
+            .unwrap_or_default();
+        active.remove(path);
+        environment
+    }
+
+    fn imported_type_environment(
+        &self,
+        file: &FileIndex,
+        active: &mut HashSet<PathBuf>,
+    ) -> TypeEnvironment {
+        let mut imports = TypeEnvironment::default();
+        for binding in &file.imports {
+            let Some(target_path) = self.module_file(&binding.module) else {
+                continue;
+            };
+            let target = self.type_environment(&target_path, active);
+            imports.bind_alias(
+                binding.local_name.as_str(),
+                binding.original_name.as_str(),
+                &target,
+            );
+        }
+        imports
+    }
+    pub(crate) fn import_closure(&self, start: &Path) -> Vec<PathBuf> {
+        fn visit(
+            package: &PackageIndex,
+            path: &Path,
+            seen: &mut HashSet<PathBuf>,
+            output: &mut Vec<PathBuf>,
+        ) {
+            if !seen.insert(path.to_path_buf()) {
+                return;
+            }
+            output.push(path.to_path_buf());
+            let Some(file) = package.files.get(path) else {
+                return;
+            };
+            for module in &file.imported_modules {
+                if let Some(next) = package.module_file(module) {
+                    visit(package, &next, seen, output);
+                }
+            }
+            for (import, _) in &file.oil_imports {
+                if let Some((next, _)) = package.oil_definition(import) {
+                    visit(package, next, seen, output);
+                }
+            }
+        }
+
+        let mut output = Vec::new();
+        visit(self, start, &mut HashSet::new(), &mut output);
+        output
     }
 
     pub(crate) fn import_cycle(&self, start: &Path) -> Option<Vec<PathBuf>> {
@@ -524,7 +589,7 @@ impl PackageIndex {
             .filter(|local| {
                 local.name == name
                     && local.range.start <= offset
-                    && local.function_range.contains(&offset)
+                    && local.scope_range.contains(&offset)
             })
             .max_by_key(|local| local.range.start)
         {
@@ -666,6 +731,7 @@ impl FileIndex {
         let processed = dialect::preprocess(&source);
         let Ok(module) = parse_str(&processed) else {
             return Self {
+                module: None,
                 source,
                 symbols: Vec::new(),
                 locals: Vec::new(),
@@ -676,9 +742,10 @@ impl FileIndex {
             };
         };
         let symbols = index_symbols(&path, &source, &module);
-        let locals = index_locals(&source, &symbols);
+        let locals = index_locals(&source, &module);
         let (imports, imported_modules) = index_imports(&module);
         Self {
+            module: Some(Arc::new(module)),
             source,
             symbols,
             locals,
@@ -806,81 +873,222 @@ fn binding(base: &ModulePath, prefix: &[String], item: &ImportItem) -> ImportBin
     }
 }
 
-fn index_locals(source: &str, symbols: &[Symbol]) -> Vec<LocalSymbol> {
-    let tokens = tokens(source);
-    let mut locals = Vec::new();
-    for function in symbols
-        .iter()
-        .filter(|symbol| symbol.kind == SymbolKind::Function)
-    {
-        let function_tokens: Vec<_> = tokens
-            .iter()
-            .filter(|(_, range)| {
-                range.start >= function.full_range.start && range.end <= function.full_range.end
-            })
-            .collect();
-        for pair in function_tokens.windows(2) {
-            let (keyword, _) = pair[0];
-            let (name, range) = pair[1];
-            if matches!(*keyword, "let" | "var" | "const") {
-                locals.push(LocalSymbol {
-                    name: (*name).into(),
-                    range: range.clone(),
-                    function_range: function.full_range.clone(),
-                });
-            }
-        }
-        if let Some(open) = source[function.range.end..function.full_range.end].find('(') {
-            let start = function.range.end + open + 1;
-            if let Some(close) = source[start..function.full_range.end].find(')') {
-                let end = start + close;
-                for (index, (name, range)) in tokens.iter().enumerate() {
-                    if range.start < start || range.end > end {
-                        continue;
-                    }
-                    if tokens
-                        .get(index + 1)
-                        .is_some_and(|(token, _)| *token == ":")
-                    {
-                        locals.push(LocalSymbol {
-                            name: (*name).into(),
-                            range: range.clone(),
-                            function_range: function.full_range.clone(),
-                        });
-                    }
+fn brace_scopes(source: &str) -> Vec<Range<usize>> {
+    let mut stack = Vec::new();
+    let mut scopes = Vec::new();
+    for (token, range) in tokens(source) {
+        match token {
+            "{" => stack.push(range.start),
+            "}" => {
+                if let Some(start) = stack.pop() {
+                    scopes.push(start..range.end);
                 }
             }
+            _ => {}
         }
+    }
+    scopes
+}
+
+fn innermost_scope(
+    scopes: &[Range<usize>],
+    offset: usize,
+    fallback: &Range<usize>,
+) -> Range<usize> {
+    scopes
+        .iter()
+        .filter(|scope| scope.start < offset && offset < scope.end)
+        .min_by_key(|scope| scope.end - scope.start)
+        .cloned()
+        .unwrap_or_else(|| fallback.clone())
+}
+
+fn index_locals(source: &str, module: &TranslationUnit) -> Vec<LocalSymbol> {
+    let scopes = brace_scopes(source);
+    let mut locals = Vec::new();
+    for declaration in &module.global_declarations {
+        let GlobalDeclaration::Function(function) = declaration.node() else {
+            continue;
+        };
+        let function_range = declaration.span().range();
+        let signature_end = source[function_range.clone()]
+            .find('{')
+            .map(|relative| function_range.start + relative)
+            .unwrap_or(function_range.end);
+        let mut parameter_start = function_range.start;
+        for parameter in &function.parameters {
+            let name = parameter.ident.name().to_string();
+            let Some(range) = find_identifier(source, parameter_start..signature_end, &name) else {
+                continue;
+            };
+            parameter_start = range.end;
+            locals.push(LocalSymbol {
+                name: name.into(),
+                range,
+                scope_range: function_range.clone(),
+            });
+        }
+        collect_compound_locals(
+            source,
+            &function.body,
+            &function_range,
+            &scopes,
+            &mut locals,
+        );
     }
     locals
 }
 
-fn textual_struct_fields(source: &str, name: &str) -> Option<Vec<String>> {
-    let declaration = format!("struct {name}");
-    let start = source.find(&declaration)? + declaration.len();
-    let open = start + source[start..].find('{')? + 1;
-    let close = open + source[open..].find('}')?;
-    let body_tokens = tokens(&source[open..close]);
-    Some(
-        body_tokens
-            .windows(2)
-            .filter(|pair| pair[1].0 == ":")
-            .map(|pair| pair[0].0.to_owned())
-            .collect(),
-    )
+fn collect_compound_locals(
+    source: &str,
+    compound: &CompoundStatement,
+    scope: &Range<usize>,
+    scopes: &[Range<usize>],
+    locals: &mut Vec<LocalSymbol>,
+) {
+    for statement in &compound.statements {
+        collect_statement_locals(source, statement, scope, scopes, locals);
+    }
 }
 
-fn identifier_before(source: &str, end: usize) -> Option<String> {
+fn compound_scope(
+    compound: &CompoundStatement,
+    fallback: &Range<usize>,
+    scopes: &[Range<usize>],
+) -> Range<usize> {
+    compound
+        .statements
+        .first()
+        .map(|statement| innermost_scope(scopes, statement.span().start, fallback))
+        .unwrap_or_else(|| fallback.clone())
+}
+
+fn collect_statement_locals(
+    source: &str,
+    statement: &StatementNode,
+    scope: &Range<usize>,
+    scopes: &[Range<usize>],
+    locals: &mut Vec<LocalSymbol>,
+) {
+    match statement.node() {
+        Statement::Declaration(declaration) => {
+            let name = declaration.ident.name().to_string();
+            if let Some(range) = find_identifier(source, statement.span().range(), &name) {
+                locals.push(LocalSymbol {
+                    name: name.into(),
+                    range,
+                    scope_range: scope.clone(),
+                });
+            }
+        }
+        Statement::Compound(compound) => {
+            let child_scope = statement.span().range();
+            collect_compound_locals(source, compound, &child_scope, scopes, locals);
+        }
+        Statement::If(branch) => {
+            let branch_scope = compound_scope(&branch.if_clause.body, scope, scopes);
+            collect_compound_locals(
+                source,
+                &branch.if_clause.body,
+                &branch_scope,
+                scopes,
+                locals,
+            );
+            for clause in &branch.else_if_clauses {
+                let clause_scope = compound_scope(&clause.body, scope, scopes);
+                collect_compound_locals(source, &clause.body, &clause_scope, scopes, locals);
+            }
+            if let Some(clause) = &branch.else_clause {
+                let clause_scope = compound_scope(&clause.body, scope, scopes);
+                collect_compound_locals(source, &clause.body, &clause_scope, scopes, locals);
+            }
+        }
+        Statement::Switch(switch) => {
+            for clause in &switch.clauses {
+                let clause_scope = compound_scope(&clause.body, scope, scopes);
+                collect_compound_locals(source, &clause.body, &clause_scope, scopes, locals);
+            }
+        }
+        Statement::Loop(loop_statement) => {
+            let body_scope = compound_scope(&loop_statement.body, scope, scopes);
+            collect_compound_locals(source, &loop_statement.body, &body_scope, scopes, locals);
+            if let Some(continuing) = &loop_statement.continuing {
+                let continuing_scope = compound_scope(&continuing.body, scope, scopes);
+                collect_compound_locals(
+                    source,
+                    &continuing.body,
+                    &continuing_scope,
+                    scopes,
+                    locals,
+                );
+            }
+        }
+        Statement::For(for_statement) => {
+            let loop_scope = statement.span().range();
+            if let Some(initializer) = &for_statement.initializer {
+                collect_statement_locals(source, initializer, &loop_scope, scopes, locals);
+            }
+            let body_scope = compound_scope(&for_statement.body, &loop_scope, scopes);
+            collect_compound_locals(source, &for_statement.body, &body_scope, scopes, locals);
+        }
+        Statement::While(while_statement) => {
+            let body_scope = compound_scope(&while_statement.body, scope, scopes);
+            collect_compound_locals(source, &while_statement.body, &body_scope, scopes, locals);
+        }
+        _ => {}
+    }
+}
+
+fn member_base_source(source: &str, dot: usize) -> Option<&str> {
+    if source.as_bytes().get(dot) != Some(&b'.') {
+        return None;
+    }
     let bytes = source.as_bytes();
-    let mut cursor = end.min(bytes.len());
-    while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+    let mut cursor = dot;
+    let mut parentheses = 0_u32;
+    let mut brackets = 0_u32;
+    while cursor > 0 {
+        let byte = bytes[cursor - 1];
+        match byte {
+            b')' => parentheses += 1,
+            b']' => brackets += 1,
+            b'(' if parentheses > 0 => parentheses -= 1,
+            b'[' if brackets > 0 => brackets -= 1,
+            b';' | b'{' | b'}' | b'=' | b',' | b'\n' if parentheses == 0 && brackets == 0 => {
+                break;
+            }
+            b'(' if parentheses == 0 && brackets == 0 => break,
+            _ => {}
+        }
         cursor -= 1;
     }
-    let identifier_end = cursor;
-    while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_') {
-        cursor -= 1;
+    let expression = source[cursor..dot].trim();
+    (!expression.is_empty()).then_some(expression)
+}
+
+fn swizzle_labels(size: u8) -> Vec<String> {
+    fn extend(labels: &mut Vec<String>, alphabet: &[u8], prefix: &mut String, remaining: u8) {
+        if remaining == 0 {
+            labels.push(prefix.clone());
+            return;
+        }
+        for component in alphabet {
+            prefix.push(char::from(*component));
+            extend(labels, alphabet, prefix, remaining - 1);
+            prefix.pop();
+        }
     }
-    (cursor < identifier_end).then(|| source[cursor..identifier_end].to_owned())
+
+    let mut labels = Vec::new();
+    for alphabet in [
+        &b"xyzw"[..size.min(4) as usize],
+        &b"rgba"[..size.min(4) as usize],
+    ] {
+        for length in 1..=4 {
+            extend(&mut labels, alphabet, &mut String::new(), length);
+        }
+    }
+    labels
 }
 
 fn declared_type_name(source: &str, name: &str, before: usize) -> Option<String> {
@@ -894,7 +1102,21 @@ fn declared_type_name(source: &str, name: &str, before: usize) -> Option<String>
             .get(index + 1)
             .is_some_and(|(token, _)| *token == ":")
         {
-            result = tokens.get(index + 2).map(|(token, _)| (*token).to_owned());
+            let start = tokens.get(index + 2)?.1.start;
+            let mut end = start;
+            let mut template_depth = 0_u32;
+            for (token, range) in tokens.iter().skip(index + 2) {
+                match *token {
+                    "<" => template_depth += 1,
+                    ">" if template_depth > 0 => template_depth -= 1,
+                    "=" | "," | ";" | ")" | "{" if template_depth == 0 => {
+                        break;
+                    }
+                    _ => {}
+                }
+                end = range.end;
+            }
+            result = (end > start).then(|| source[start..end].trim().to_owned());
         } else if tokens
             .get(index + 1)
             .is_some_and(|(token, _)| *token == "=")
@@ -1008,4 +1230,33 @@ fn is_identifier(name: &str) -> bool {
 
 fn is_builtin(name: &str) -> bool {
     builtin(name).is_some() || BUILTIN_TYPES.contains(&name)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
+    use super::{FileIndex, declared_type_name, member_base_source};
+    use crate::ty::{Ty, TypeEnvironment, infer_expression_type};
+
+    #[test]
+    fn recovers_expression_type_from_last_good_index() {
+        let good = "struct Item { value: f32, }\nfn main() { let v: vec3<f32> = vec3(0.0); var item: Item; let q = v; }";
+        let mut file = FileIndex::new(PathBuf::from("shader.wesl"), Arc::from(good));
+        let edited = good.replace("let q = v;", "v.");
+        file.source = Arc::from(edited.clone());
+        let dot = edited.find("v.").unwrap() + 1;
+        let base = member_base_source(&edited, dot).unwrap();
+        assert_eq!(base, "v");
+        let type_name = declared_type_name(&edited, "v", dot).unwrap();
+        assert_eq!(type_name, "vec3<f32>");
+        let expression = base.parse().unwrap();
+        let ty = infer_expression_type(
+            file.module.as_deref().unwrap(),
+            expression,
+            &HashMap::from([("v".to_owned(), type_name)]),
+            TypeEnvironment::default(),
+        );
+        assert_eq!(ty, Ty::Vector(3, Box::new(Ty::F32)));
+    }
 }

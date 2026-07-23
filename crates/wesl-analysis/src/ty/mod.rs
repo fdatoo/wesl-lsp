@@ -5,6 +5,14 @@ use wgsl_parse::syntax::{
     DeclarationKind, Expression, ExpressionNode, FunctionCall, GlobalDeclaration,
     LiteralExpression, Statement, StatementNode, TranslationUnit, TypeExpression, UnaryOperator,
 };
+use wgsl_types::{
+    Error as WgslTypeError,
+    builtin::{type_builtin_fn, type_ctor, typecheck_struct_ctor},
+    inst::LiteralInstance,
+    syntax::BuiltinValue,
+    tplt::TpltParam,
+    ty::{StructMemberType, StructType, Type as WgslType},
+};
 
 use crate::builtin;
 
@@ -62,6 +70,16 @@ impl Ty {
         matches!(self, Self::AbstractInt | Self::I32 | Self::U32)
     }
 
+    fn is_numeric(&self) -> bool {
+        self.is_numeric_scalar()
+            || matches!(self, Self::Vector(_, element) | Self::Matrix(_, _, element) if element.is_numeric_scalar())
+    }
+
+    fn is_integer(&self) -> bool {
+        self.is_integer_scalar()
+            || matches!(self, Self::Vector(_, element) if element.is_integer_scalar())
+    }
+
     fn element(&self) -> Option<&Ty> {
         match self {
             Self::Vector(_, element)
@@ -93,6 +111,7 @@ impl Ty {
             {
                 Some(2)
             }
+            (Self::AbstractInt, Self::AbstractFloat) => Some(1),
             (Self::AbstractInt, Self::I32 | Self::U32) => Some(1),
             (Self::AbstractInt, Self::F32 | Self::F16) => Some(2),
             (Self::AbstractFloat, Self::F32 | Self::F16) => Some(1),
@@ -123,6 +142,76 @@ impl Ty {
             Self::AbstractFloat => Self::F32,
             Self::Vector(size, element) => Self::Vector(size, Box::new(element.concretize())),
             other => other,
+        }
+    }
+
+    fn to_wgsl_type(&self) -> Option<WgslType> {
+        match self {
+            Self::Unknown | Self::Void | Self::Sampler | Self::Texture => None,
+            Self::Bool => Some(WgslType::Bool),
+            Self::AbstractInt => Some(WgslType::AbstractInt),
+            Self::AbstractFloat => Some(WgslType::AbstractFloat),
+            Self::I32 => Some(WgslType::I32),
+            Self::U32 => Some(WgslType::U32),
+            Self::F32 => Some(WgslType::F32),
+            Self::F16 => Some(WgslType::F16),
+            Self::Vector(size, element) => {
+                Some(WgslType::Vec(*size, Box::new(element.to_wgsl_type()?)))
+            }
+            Self::Matrix(columns, rows, element) => Some(WgslType::Mat(
+                *columns,
+                *rows,
+                Box::new(element.to_wgsl_type()?),
+            )),
+            Self::Array(element, size) => Some(WgslType::Array(
+                Box::new(element.to_wgsl_type()?),
+                size.map(|size| size as usize),
+            )),
+            Self::Struct(name, fields) => Some(WgslType::Struct(Box::new(StructType {
+                name: name.clone(),
+                members: fields
+                    .iter()
+                    .map(|(name, ty)| Some(StructMemberType::new(name.clone(), ty.to_wgsl_type()?)))
+                    .collect::<Option<Vec<_>>>()?,
+            }))),
+            Self::Pointer(_) | Self::Atomic(_) => None,
+        }
+    }
+
+    fn from_wgsl_type(ty: WgslType) -> Self {
+        match ty {
+            WgslType::Unknown => Self::Unknown,
+            WgslType::Bool => Self::Bool,
+            WgslType::AbstractInt => Self::AbstractInt,
+            WgslType::AbstractFloat => Self::AbstractFloat,
+            WgslType::I32 => Self::I32,
+            WgslType::U32 => Self::U32,
+            WgslType::F32 => Self::F32,
+            WgslType::F16 => Self::F16,
+            WgslType::Vec(size, element) => {
+                Self::Vector(size, Box::new(Self::from_wgsl_type(*element)))
+            }
+            WgslType::Mat(columns, rows, element) => {
+                Self::Matrix(columns, rows, Box::new(Self::from_wgsl_type(*element)))
+            }
+            WgslType::Array(element, size) => Self::Array(
+                Box::new(Self::from_wgsl_type(*element)),
+                size.and_then(|size| u32::try_from(size).ok()),
+            ),
+            WgslType::Struct(structure) => Self::Struct(
+                structure.name,
+                structure
+                    .members
+                    .into_iter()
+                    .map(|member| (member.name, Self::from_wgsl_type(member.ty)))
+                    .collect(),
+            ),
+            WgslType::Ptr(_, element, _) | WgslType::Ref(_, element, _) => {
+                Self::Pointer(Box::new(Self::from_wgsl_type(*element)))
+            }
+            WgslType::Atomic(element) => Self::Atomic(Box::new(Self::from_wgsl_type(*element))),
+            WgslType::Sampler(_) => Self::Sampler,
+            WgslType::Texture(_) => Self::Texture,
         }
     }
 }
@@ -168,29 +257,90 @@ struct FunctionTy {
     declaration: Range<usize>,
 }
 
-#[derive(Default)]
-struct ModuleTypes {
+#[derive(Clone, Default)]
+pub(crate) struct TypeEnvironment {
     named: HashMap<String, Ty>,
     globals: HashMap<String, Ty>,
     functions: HashMap<String, FunctionTy>,
 }
 
-pub fn check_module(module: &TranslationUnit) -> Vec<TypeDiagnostic> {
+impl TypeEnvironment {
+    pub(crate) fn bind_alias(&mut self, local_name: &str, original_name: &str, source: &Self) {
+        if let Some(ty) = source.named.get(original_name) {
+            self.named.insert(local_name.to_owned(), ty.clone());
+        }
+        if let Some(ty) = source.globals.get(original_name) {
+            self.globals.insert(local_name.to_owned(), ty.clone());
+        }
+        if let Some(function) = source.functions.get(original_name) {
+            self.functions
+                .insert(local_name.to_owned(), function.clone());
+        }
+    }
+}
+
+pub(crate) fn analyze_module(
+    module: &TranslationUnit,
+    types: TypeEnvironment,
+) -> (Vec<TypeDiagnostic>, TypeEnvironment) {
     let mut checker = Checker {
         module,
-        types: ModuleTypes::default(),
+        types,
         diagnostics: Vec::new(),
     };
     checker.collect_types();
     checker.check_globals();
     checker.check_functions();
     checker.check_const_asserts();
-    checker.diagnostics
+    (checker.diagnostics, checker.types)
 }
 
+pub fn check_module(module: &TranslationUnit) -> Vec<TypeDiagnostic> {
+    analyze_module(module, TypeEnvironment::default()).0
+}
+
+pub(crate) fn infer_expression_type(
+    module: &TranslationUnit,
+    expression: Expression,
+    local_type_names: &HashMap<String, String>,
+    types: TypeEnvironment,
+) -> Ty {
+    let mut checker = Checker {
+        module,
+        types,
+        diagnostics: Vec::new(),
+    };
+    checker.collect_types();
+    checker.check_globals();
+    let locals = local_type_names
+        .iter()
+        .filter_map(|(name, type_name)| {
+            let source = if (type_name.starts_with("vec") || type_name.starts_with("mat"))
+                && !type_name.contains('<')
+            {
+                format!("alias __LocalType = {type_name}<f32>;")
+            } else {
+                format!("alias __LocalType = {type_name};")
+            };
+            let wrapper = wgsl_parse::parse_str(&source).ok()?;
+            let ty = wrapper
+                .global_declarations
+                .into_iter()
+                .find_map(|declaration| {
+                    if let GlobalDeclaration::TypeAlias(alias) = declaration.into_inner() {
+                        Some(alias.ty)
+                    } else {
+                        None
+                    }
+                })?;
+            Some((name.clone(), checker.resolve_type(&ty)))
+        })
+        .collect();
+    checker.infer_expression(&ExpressionNode::from(expression), &locals)
+}
 struct Checker<'a> {
     module: &'a TranslationUnit,
-    types: ModuleTypes,
+    types: TypeEnvironment,
     diagnostics: Vec<TypeDiagnostic>,
 }
 
@@ -207,16 +357,16 @@ impl Checker<'_> {
         for declaration in &self.module.global_declarations {
             match declaration.node() {
                 GlobalDeclaration::Struct(structure) => {
-                    let fields = structure
-                        .members
-                        .iter()
-                        .map(|member| {
-                            (
-                                member.ident.name().to_string(),
-                                self.resolve_type(&member.ty),
-                            )
-                        })
-                        .collect();
+                    let mut fields = Vec::with_capacity(structure.members.len());
+                    for member in &structure.members {
+                        let ty = self.resolve_type(&member.ty);
+                        self.check_io_attributes(
+                            &member.attributes,
+                            &ty,
+                            declaration.span().range(),
+                        );
+                        fields.push((member.ident.name().to_string(), ty));
+                    }
                     self.types.named.insert(
                         structure.ident.name().to_string(),
                         Ty::Struct(structure.ident.name().to_string(), fields),
@@ -312,6 +462,7 @@ impl Checker<'_> {
                 .get(function.ident.name().as_str())
                 .cloned()
                 .unwrap();
+            self.check_function_attributes(function, declaration.span().range());
             let mut locals = self.types.globals.clone();
             for (parameter, ty) in function.parameters.iter().zip(&signature.parameters) {
                 locals.insert(parameter.ident.name().to_string(), ty.clone());
@@ -352,6 +503,44 @@ impl Checker<'_> {
         }
     }
 
+    fn check_function_attributes(
+        &mut self,
+        function: &wgsl_parse::syntax::Function,
+        declaration: Range<usize>,
+    ) {
+        let globals = self.types.globals.clone();
+        for attribute in &function.attributes {
+            let Attribute::WorkgroupSize(size) = attribute.node() else {
+                continue;
+            };
+            let expressions = std::iter::once(&size.x)
+                .chain(size.y.iter())
+                .chain(size.z.iter());
+            for expression in expressions {
+                let ty = self.infer_expression(expression, &globals);
+                if !ty.is_unknown() && !ty.is_integer_scalar() {
+                    self.diagnostics.push(TypeDiagnostic {
+                        range: expression.span().range(),
+                        message: format!("@workgroup_size value must be an integer, found {ty}"),
+                        related: vec![(
+                            declaration.clone(),
+                            "entry point declared here".to_owned(),
+                        )],
+                    });
+                } else if const_u32(self.module, expression) == Some(0) {
+                    self.diagnostics.push(TypeDiagnostic {
+                        range: expression.span().range(),
+                        message: "@workgroup_size value must be greater than zero".to_owned(),
+                        related: vec![(
+                            declaration.clone(),
+                            "entry point declared here".to_owned(),
+                        )],
+                    });
+                }
+            }
+        }
+    }
+
     fn check_io_attributes(
         &mut self,
         attributes: &[wgsl_parse::syntax::AttributeNode],
@@ -359,18 +548,39 @@ impl Checker<'_> {
         declaration: Range<usize>,
     ) {
         for attribute in attributes {
-            if matches!(attribute.node(), Attribute::Location(_))
-                && !ty.is_unknown()
-                && !ty.is_numeric_scalar()
-                && !matches!(ty, Ty::Vector(_, element) if element.is_numeric_scalar())
-            {
-                self.diagnostics.push(TypeDiagnostic {
-                    range: attribute.span().range(),
-                    message: format!(
-                        "@location value must be a numeric scalar or vector, found {ty}"
-                    ),
-                    related: vec![(declaration.clone(), "entry point declared here".to_owned())],
-                });
+            match attribute.node() {
+                Attribute::Location(_)
+                    if !ty.is_unknown()
+                        && !ty.is_numeric_scalar()
+                        && !matches!(ty, Ty::Vector(_, element) if element.is_numeric_scalar()) =>
+                {
+                    self.diagnostics.push(TypeDiagnostic {
+                        range: attribute.span().range(),
+                        message: format!(
+                            "@location value must be a numeric scalar or vector, found {ty}"
+                        ),
+                        related: vec![(
+                            declaration.clone(),
+                            "entry point declared here".to_owned(),
+                        )],
+                    });
+                }
+                Attribute::Builtin(value) => {
+                    if let Some(expected) = builtin_value_type(*value)
+                        && !ty.is_unknown()
+                        && ty.conversion_rank_to(&expected).is_none()
+                    {
+                        self.diagnostics.push(TypeDiagnostic {
+                            range: attribute.span().range(),
+                            message: format!("@builtin value requires type {expected}, found {ty}"),
+                            related: vec![(
+                                declaration.clone(),
+                                "entry point declared here".to_owned(),
+                            )],
+                        });
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -419,6 +629,28 @@ impl Checker<'_> {
                             "assignment target".to_owned(),
                         )),
                     );
+                } else if let Some(operator) = assignment_binary_operator(assignment.operator) {
+                    let result = infer_binary_result(operator, left.clone(), right.clone());
+                    if result.is_unknown() && !left.contains_unknown() && !right.contains_unknown()
+                    {
+                        self.invalid_operator(
+                            statement.span().range(),
+                            format!(
+                                "operator {:?} is not defined for {left} and {right}",
+                                assignment.operator
+                            ),
+                        );
+                    } else {
+                        self.check_compatible(
+                            assignment.rhs.span().range(),
+                            &result,
+                            &left,
+                            Some((
+                                assignment.lhs.span().range(),
+                                "assignment target".to_owned(),
+                            )),
+                        );
+                    }
                 }
             }
             Statement::Increment(increment) => {
@@ -637,12 +869,15 @@ impl Checker<'_> {
                 match unary.operator {
                     UnaryOperator::LogicalNegation => match operand {
                         Ty::Bool => Ty::Bool,
-                        Ty::Vector(size, element) if *element == Ty::Bool => {
+                        Ty::Vector(size, element) if element.is_bool() || element.is_unknown() => {
                             Ty::Vector(size, element)
                         }
                         Ty::Unknown => Ty::Unknown,
                         other => {
-                            self.check_bool(unary.operand.span().range(), &other);
+                            self.invalid_operator(
+                                expression.span().range(),
+                                format!("operator ! is not defined for {other}"),
+                            );
                             Ty::Unknown
                         }
                     },
@@ -651,46 +886,42 @@ impl Checker<'_> {
                         Ty::Pointer(inner) => *inner,
                         Ty::Unknown => Ty::Unknown,
                         other => {
-                            self.diagnostics.push(TypeDiagnostic {
-                                range: unary.operand.span().range(),
-                                message: format!("cannot dereference {other}"),
-                                related: Vec::new(),
-                            });
+                            self.invalid_operator(
+                                expression.span().range(),
+                                format!("cannot dereference {other}"),
+                            );
                             Ty::Unknown
                         }
                     },
-                    UnaryOperator::Negation | UnaryOperator::BitwiseComplement => operand,
+                    UnaryOperator::Negation if operand.is_numeric() => operand,
+                    UnaryOperator::BitwiseComplement if operand.is_integer() => operand,
+                    _ if operand.is_unknown() => Ty::Unknown,
+                    _ => {
+                        self.invalid_operator(
+                            expression.span().range(),
+                            format!("operator {:?} is not defined for {operand}", unary.operator),
+                        );
+                        Ty::Unknown
+                    }
                 }
             }
             Expression::Binary(binary) => {
                 let left = self.infer_expression(&binary.left, locals);
                 let right = self.infer_expression(&binary.right, locals);
-                match binary.operator {
-                    BinaryOperator::ShortCircuitOr | BinaryOperator::ShortCircuitAnd => {
-                        self.check_bool(binary.left.span().range(), &left);
-                        self.check_bool(binary.right.span().range(), &right);
-                        Ty::Bool
-                    }
-                    BinaryOperator::Equality
-                    | BinaryOperator::Inequality
-                    | BinaryOperator::LessThan
-                    | BinaryOperator::LessThanEqual
-                    | BinaryOperator::GreaterThan
-                    | BinaryOperator::GreaterThanEqual => {
-                        if right.conversion_rank_to(&left).is_none()
-                            && left.conversion_rank_to(&right).is_none()
-                        {
-                            self.check_compatible(binary.right.span().range(), &right, &left, None);
-                        }
-                        match left {
-                            Ty::Vector(size, _) => Ty::Vector(size, Box::new(Ty::Bool)),
-                            Ty::Unknown => Ty::Unknown,
-                            _ => Ty::Bool,
-                        }
-                    }
-                    BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => left,
-                    _ => unify_numeric(left, right),
+                if left.contains_unknown() || right.contains_unknown() {
+                    return infer_binary_result(binary.operator, left, right);
                 }
+                let result = infer_binary_result(binary.operator, left.clone(), right.clone());
+                if result.is_unknown() {
+                    self.invalid_operator(
+                        expression.span().range(),
+                        format!(
+                            "operator {:?} is not defined for {left} and {right}",
+                            binary.operator
+                        ),
+                    );
+                }
+                result
             }
             Expression::FunctionCall(call) => {
                 self.infer_call(call, expression.span().range(), locals)
@@ -713,10 +944,6 @@ impl Checker<'_> {
             return Ty::Unknown;
         }
         let name = call.ty.ident.name().to_string();
-        let constructor = self.resolve_type(&call.ty);
-        if !constructor.is_unknown() {
-            return fill_constructor_type(constructor, &arguments);
-        }
         if let Some(function) = self.types.functions.get(&name).cloned() {
             for (index, (actual, expected)) in
                 arguments.iter().zip(&function.parameters).enumerate()
@@ -746,31 +973,115 @@ impl Checker<'_> {
             }
             return function.result;
         }
-        if let Some(function) = builtin(&name) {
-            let arity_matches = function
-                .overloads
-                .iter()
-                .filter(|overload| signature_accepts_arity(overload.signature, arguments.len()))
-                .count();
-            if arity_matches == 0
-                && function
-                    .overloads
-                    .iter()
-                    .all(|overload| signature_has_fixed_arity(overload.signature))
-            {
+        let constructor = self.resolve_type(&call.ty);
+        if !constructor.is_unknown() {
+            if arguments.iter().any(Ty::contains_unknown) {
+                return fill_constructor_type(constructor, &arguments);
+            }
+            if !constructor_shape_valid(&constructor, &arguments) {
                 self.diagnostics.push(TypeDiagnostic {
                     range,
-                    message: format!(
-                        "no matching overload for {name} with {} arguments",
-                        arguments.len()
-                    ),
+                    message: format!("invalid constructor {name}: argument shape does not match"),
                     related: Vec::new(),
                 });
                 return Ty::Unknown;
             }
-            return builtin_result(&name, &arguments);
+            let Some(argument_types) = arguments
+                .iter()
+                .map(Ty::to_wgsl_type)
+                .collect::<Option<Vec<_>>>()
+            else {
+                return constructor;
+            };
+            let result = if matches!(constructor, Ty::Struct(_, _)) {
+                let Some(WgslType::Struct(structure)) = constructor.to_wgsl_type() else {
+                    return constructor;
+                };
+                typecheck_struct_ctor(&structure, &argument_types)
+                    .map(|()| WgslType::Struct(structure))
+            } else if let Some(constructor_name) = constructor_name(&constructor) {
+                let templates = constructor_templates(&constructor);
+                type_ctor(&constructor_name, templates.as_deref(), &argument_types)
+            } else {
+                self.diagnostics.push(TypeDiagnostic {
+                    range,
+                    message: format!("{name} is not constructible"),
+                    related: Vec::new(),
+                });
+                return Ty::Unknown;
+            };
+            return match result {
+                Ok(result) => Ty::from_wgsl_type(result),
+                Err(error) => {
+                    self.diagnostics.push(TypeDiagnostic {
+                        range,
+                        message: format!("invalid constructor {name}: {error}"),
+                        related: Vec::new(),
+                    });
+                    Ty::Unknown
+                }
+            };
+        }
+        if let Some(function) = builtin(&name) {
+            if arguments.iter().any(Ty::contains_unknown) {
+                return Ty::Unknown;
+            }
+            let Ok(templates) = self.template_parameters(&call.ty) else {
+                return Ty::Unknown;
+            };
+            match resolve_builtin_overload(&name, templates.as_deref(), &arguments) {
+                BuiltinResolution::Match(Some(result)) => return Ty::from_wgsl_type(result),
+                BuiltinResolution::Match(None) => return Ty::Void,
+                BuiltinResolution::Unknown => return Ty::Unknown,
+                BuiltinResolution::NoMatch(error) => {
+                    let candidates = function
+                        .overloads
+                        .iter()
+                        .map(|overload| overload.signature)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    self.diagnostics.push(TypeDiagnostic {
+                        range,
+                        message: format!(
+                            "no matching overload for {name}({}): {error}; candidates: {candidates}",
+                            arguments
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        related: Vec::new(),
+                    });
+                    return Ty::Unknown;
+                }
+            }
         }
         Ty::Unknown
+    }
+
+    fn template_parameters(&self, ty: &TypeExpression) -> Result<Option<Vec<TpltParam>>, ()> {
+        ty.template_args
+            .as_ref()
+            .map(|arguments| {
+                arguments
+                    .iter()
+                    .map(|argument| match argument.expression.node() {
+                        Expression::TypeOrIdentifier(ty) => self
+                            .resolve_type(ty)
+                            .to_wgsl_type()
+                            .map(TpltParam::Type)
+                            .ok_or(()),
+                        Expression::Literal(LiteralExpression::AbstractInt(value)) => Ok(
+                            TpltParam::Instance(LiteralInstance::AbstractInt(*value).into()),
+                        ),
+                        Expression::Literal(LiteralExpression::U32(value)) => {
+                            Ok(TpltParam::Instance(LiteralInstance::U32(*value).into()))
+                        }
+                        _ => Err(()),
+                    })
+                    .collect()
+            })
+            .transpose()
     }
 
     fn resolve_type(&self, ty: &TypeExpression) -> Ty {
@@ -788,6 +1099,13 @@ impl Checker<'_> {
                 let size = name.as_bytes()[3] - b'0';
                 Ty::Vector(size, Box::new(self.template_type(ty, 0)))
             }
+            name if name.len() == 5 && name.starts_with("vec") => {
+                let bytes = name.as_bytes();
+                Ty::Vector(
+                    bytes[3] - b'0',
+                    Box::new(shorthand_scalar(bytes[4]).unwrap_or(Ty::Unknown)),
+                )
+            }
             name if name.starts_with("mat") && name.len() == 6 => {
                 let bytes = name.as_bytes();
                 Ty::Matrix(
@@ -796,7 +1114,21 @@ impl Checker<'_> {
                     Box::new(self.template_type(ty, 0)),
                 )
             }
-            "array" => Ty::Array(Box::new(self.template_type(ty, 0)), template_u32(ty, 1)),
+            name if name.len() == 7 && name.starts_with("mat") => {
+                let bytes = name.as_bytes();
+                Ty::Matrix(
+                    bytes[3] - b'0',
+                    bytes[5] - b'0',
+                    Box::new(shorthand_scalar(bytes[6]).unwrap_or(Ty::Unknown)),
+                )
+            }
+            "array" => Ty::Array(
+                Box::new(self.template_type(ty, 0)),
+                ty.template_args
+                    .as_ref()
+                    .and_then(|arguments| arguments.get(1))
+                    .and_then(|argument| const_u32(self.module, &argument.expression)),
+            ),
             "ptr" => Ty::Pointer(Box::new(self.template_type(ty, 1))),
             "atomic" => Ty::Atomic(Box::new(self.template_type(ty, 0))),
             "sampler" | "sampler_comparison" => Ty::Sampler,
@@ -852,17 +1184,97 @@ impl Checker<'_> {
             });
         }
     }
+    fn invalid_operator(&mut self, range: Range<usize>, message: String) {
+        self.diagnostics.push(TypeDiagnostic {
+            range,
+            message,
+            related: Vec::new(),
+        });
+    }
 }
 
-fn template_u32(ty: &TypeExpression, index: usize) -> Option<u32> {
-    ty.template_args
-        .as_ref()?
-        .get(index)
-        .and_then(|argument| match argument.expression.node() {
-            Expression::Literal(LiteralExpression::AbstractInt(value)) => (*value).try_into().ok(),
-            Expression::Literal(LiteralExpression::U32(value)) => Some(*value),
-            _ => None,
-        })
+fn builtin_value_type(value: BuiltinValue) -> Option<Ty> {
+    match value {
+        BuiltinValue::VertexIndex
+        | BuiltinValue::InstanceIndex
+        | BuiltinValue::SampleIndex
+        | BuiltinValue::SampleMask
+        | BuiltinValue::LocalInvocationIndex => Some(Ty::U32),
+        BuiltinValue::Position => Some(Ty::Vector(4, Box::new(Ty::F32))),
+        BuiltinValue::FrontFacing => Some(Ty::Bool),
+        BuiltinValue::FragDepth => Some(Ty::F32),
+        BuiltinValue::LocalInvocationId
+        | BuiltinValue::GlobalInvocationId
+        | BuiltinValue::WorkgroupId
+        | BuiltinValue::NumWorkgroups => Some(Ty::Vector(3, Box::new(Ty::U32))),
+        BuiltinValue::ClipDistances
+        | BuiltinValue::SubgroupInvocationId
+        | BuiltinValue::SubgroupSize => None,
+    }
+}
+
+fn shorthand_scalar(suffix: u8) -> Option<Ty> {
+    match suffix {
+        b'f' => Some(Ty::F32),
+        b'h' => Some(Ty::F16),
+        b'i' => Some(Ty::I32),
+        b'u' => Some(Ty::U32),
+        _ => None,
+    }
+}
+
+fn constructor_name(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::Bool => Some("bool".to_owned()),
+        Ty::I32 => Some("i32".to_owned()),
+        Ty::U32 => Some("u32".to_owned()),
+        Ty::F32 => Some("f32".to_owned()),
+        Ty::F16 => Some("f16".to_owned()),
+        Ty::Vector(size, _) => Some(format!("vec{size}")),
+        Ty::Matrix(columns, rows, _) => Some(format!("mat{columns}x{rows}")),
+        Ty::Array(_, _) => Some("array".to_owned()),
+        _ => None,
+    }
+}
+
+fn constructor_templates(ty: &Ty) -> Option<Vec<TpltParam>> {
+    let template = match ty {
+        Ty::Vector(_, element) | Ty::Matrix(_, _, element) => {
+            vec![TpltParam::Type(element.to_wgsl_type()?)]
+        }
+        Ty::Array(element, size) => {
+            let mut template = vec![TpltParam::Type(element.to_wgsl_type()?)];
+            if let Some(size) = size {
+                template.push(TpltParam::Instance(
+                    LiteralInstance::AbstractInt(i64::from(*size)).into(),
+                ));
+            }
+            template
+        }
+        _ => return None,
+    };
+    Some(template)
+}
+
+fn constructor_shape_valid(constructor: &Ty, arguments: &[Ty]) -> bool {
+    match (constructor, arguments) {
+        (Ty::Vector(expected, _), [Ty::Vector(actual, _)]) => expected == actual,
+        (
+            Ty::Matrix(expected_columns, expected_rows, _),
+            [Ty::Matrix(actual_columns, actual_rows, _)],
+        ) => expected_columns == actual_columns && expected_rows == actual_rows,
+        _ => true,
+    }
+}
+
+fn const_u32(module: &TranslationUnit, expression: &ExpressionNode) -> Option<u32> {
+    let (result, _) = wesl::eval(expression.node(), module);
+    match result.ok()? {
+        wesl::eval::Instance::Literal(LiteralInstance::AbstractInt(value)) => value.try_into().ok(),
+        wesl::eval::Instance::Literal(LiteralInstance::I32(value)) => value.try_into().ok(),
+        wesl::eval::Instance::Literal(LiteralInstance::U32(value)) => Some(value),
+        _ => None,
+    }
 }
 
 fn member_type(base: Ty, name: &str) -> Option<Ty> {
@@ -930,10 +1342,16 @@ fn fill_constructor_type(constructor: Ty, arguments: &[Ty]) -> Ty {
         other => other,
     }
 }
-
 fn unify_numeric(left: Ty, right: Ty) -> Ty {
     if left.is_unknown() || right.is_unknown() {
         return Ty::Unknown;
+    }
+    match (&left, &right) {
+        (Ty::Vector(_, _), scalar) if scalar.is_numeric_scalar() => return left,
+        (scalar, Ty::Vector(_, _)) if scalar.is_numeric_scalar() => return right,
+        (Ty::Matrix(_, _, _), scalar) if scalar.is_numeric_scalar() => return left,
+        (scalar, Ty::Matrix(_, _, _)) if scalar.is_numeric_scalar() => return right,
+        _ => {}
     }
     if left.conversion_rank_to(&right).is_some() {
         return right;
@@ -941,63 +1359,275 @@ fn unify_numeric(left: Ty, right: Ty) -> Ty {
     if right.conversion_rank_to(&left).is_some() {
         return left;
     }
-    match (&left, &right) {
-        (Ty::Vector(_, _), scalar) if scalar.is_numeric_scalar() => left,
-        (scalar, Ty::Vector(_, _)) if scalar.is_numeric_scalar() => right,
-        _ => Ty::Unknown,
-    }
+    Ty::Unknown
 }
 
-fn builtin_result(name: &str, arguments: &[Ty]) -> Ty {
-    let first = arguments.first().cloned().unwrap_or(Ty::Unknown);
-    match name {
-        "all" | "any" => Ty::Bool,
-        "arrayLength" | "textureNumLayers" | "textureNumLevels" | "textureNumSamples" => Ty::U32,
-        "dot" | "length" | "distance" | "determinant" => {
-            first.element().cloned().unwrap_or(first).concretize()
+enum BuiltinResolution {
+    Match(Option<WgslType>),
+    NoMatch(String),
+    Unknown,
+}
+
+fn builtin_conversion_candidates(ty: &Ty) -> Vec<(u8, WgslType)> {
+    let mut candidates = Vec::new();
+    if let Some(exact) = ty.to_wgsl_type() {
+        candidates.push((0, exact));
+    }
+    match ty {
+        Ty::AbstractInt => {
+            candidates.extend([
+                (1, WgslType::AbstractFloat),
+                (1, WgslType::I32),
+                (1, WgslType::U32),
+                (2, WgslType::F32),
+                (2, WgslType::F16),
+            ]);
         }
-        "textureDimensions" => Ty::Unknown,
-        "textureLoad"
-        | "textureSample"
-        | "textureSampleBias"
-        | "textureSampleCompare"
-        | "textureSampleCompareLevel"
-        | "textureSampleGrad"
-        | "textureSampleLevel" => Ty::Unknown,
-        "select" if arguments.len() >= 2 => arguments[0].clone().concretize(),
-        _ => Ty::Unknown,
+        Ty::AbstractFloat => {
+            candidates.extend([(1, WgslType::F32), (1, WgslType::F16)]);
+        }
+        Ty::Vector(size, element) => {
+            for (rank, element) in builtin_conversion_candidates(element) {
+                let candidate = WgslType::Vec(*size, Box::new(element));
+                if !candidates
+                    .iter()
+                    .any(|(_, existing)| existing == &candidate)
+                {
+                    candidates.push((rank, candidate));
+                }
+            }
+        }
+        Ty::Matrix(columns, rows, element) => {
+            for (rank, element) in builtin_conversion_candidates(element) {
+                let candidate = WgslType::Mat(*columns, *rows, Box::new(element));
+                if !candidates
+                    .iter()
+                    .any(|(_, existing)| existing == &candidate)
+                {
+                    candidates.push((rank, candidate));
+                }
+            }
+        }
+        Ty::Array(element, size) => {
+            for (rank, element) in builtin_conversion_candidates(element) {
+                let candidate = WgslType::Array(Box::new(element), size.map(|size| size as usize));
+                if !candidates
+                    .iter()
+                    .any(|(_, existing)| existing == &candidate)
+                {
+                    candidates.push((rank, candidate));
+                }
+            }
+        }
+        _ => {}
     }
+    candidates
 }
 
-fn signature_has_fixed_arity(signature: &str) -> bool {
-    !signature.contains("...") && !signature.contains("optional")
-}
+fn resolve_builtin_overload(
+    name: &str,
+    templates: Option<&[TpltParam]>,
+    arguments: &[Ty],
+) -> BuiltinResolution {
+    struct Search {
+        best: Option<(u16, Option<WgslType>)>,
+        ambiguous: bool,
+        error: Option<String>,
+        implemented: bool,
+    }
 
-fn signature_accepts_arity(signature: &str, actual: usize) -> bool {
-    let Some(start) = signature.find('(') else {
-        return true;
-    };
-    let Some(end) = signature.rfind(')') else {
-        return true;
-    };
-    let parameters = &signature[start + 1..end];
-    if parameters.trim().is_empty() {
-        return actual == 0;
-    }
-    if parameters.contains("...") {
-        return true;
-    }
-    let mut depth = 0;
-    let mut count = 1;
-    for character in parameters.chars() {
-        match character {
-            '<' | '(' => depth += 1,
-            '>' | ')' => depth -= 1,
-            ',' if depth == 0 => count += 1,
-            _ => {}
+    fn visit(
+        name: &str,
+        templates: Option<&[TpltParam]>,
+        candidates: &[Vec<(u8, WgslType)>],
+        index: usize,
+        rank: u16,
+        arguments: &mut Vec<WgslType>,
+        search: &mut Search,
+    ) {
+        if search.best.as_ref().is_some_and(|(best, _)| rank > *best) {
+            return;
+        }
+        if index == candidates.len() {
+            match type_builtin_fn(name, templates, arguments) {
+                Ok(result) => match &search.best {
+                    None => search.best = Some((rank, result)),
+                    Some((best_rank, best_result)) if rank < *best_rank => {
+                        search.best = Some((rank, result));
+                        search.ambiguous = false;
+                    }
+                    Some((best_rank, best_result))
+                        if rank == *best_rank && best_result != &result =>
+                    {
+                        search.ambiguous = true;
+                    }
+                    _ => {}
+                },
+                Err(WgslTypeError::Todo(_)) => {}
+                Err(error) => {
+                    search.implemented = true;
+                    search.error.get_or_insert_with(|| error.to_string());
+                }
+            }
+            return;
+        }
+        for (conversion_rank, argument) in &candidates[index] {
+            arguments.push(argument.clone());
+            visit(
+                name,
+                templates,
+                candidates,
+                index + 1,
+                rank + u16::from(*conversion_rank),
+                arguments,
+                search,
+            );
+            arguments.pop();
         }
     }
-    actual == count
+
+    let candidates = arguments
+        .iter()
+        .map(builtin_conversion_candidates)
+        .collect::<Vec<_>>();
+    if candidates.iter().any(Vec::is_empty) {
+        return BuiltinResolution::Unknown;
+    }
+    let mut search = Search {
+        best: None,
+        ambiguous: false,
+        error: None,
+        implemented: false,
+    };
+    visit(
+        name,
+        templates,
+        &candidates,
+        0,
+        0,
+        &mut Vec::with_capacity(arguments.len()),
+        &mut search,
+    );
+    if search.ambiguous {
+        BuiltinResolution::NoMatch("ambiguous automatic conversions".to_owned())
+    } else if let Some((_, result)) = search.best {
+        BuiltinResolution::Match(result)
+    } else if search.implemented {
+        BuiltinResolution::NoMatch(
+            search
+                .error
+                .unwrap_or_else(|| "arguments do not satisfy any overload".to_owned()),
+        )
+    } else {
+        BuiltinResolution::Unknown
+    }
+}
+
+fn assignment_binary_operator(operator: AssignmentOperator) -> Option<BinaryOperator> {
+    match operator {
+        AssignmentOperator::Equal => None,
+        AssignmentOperator::PlusEqual => Some(BinaryOperator::Addition),
+        AssignmentOperator::MinusEqual => Some(BinaryOperator::Subtraction),
+        AssignmentOperator::TimesEqual => Some(BinaryOperator::Multiplication),
+        AssignmentOperator::DivisionEqual => Some(BinaryOperator::Division),
+        AssignmentOperator::ModuloEqual => Some(BinaryOperator::Remainder),
+        AssignmentOperator::AndEqual => Some(BinaryOperator::BitwiseAnd),
+        AssignmentOperator::OrEqual => Some(BinaryOperator::BitwiseOr),
+        AssignmentOperator::XorEqual => Some(BinaryOperator::BitwiseXor),
+        AssignmentOperator::ShiftRightAssign => Some(BinaryOperator::ShiftRight),
+        AssignmentOperator::ShiftLeftAssign => Some(BinaryOperator::ShiftLeft),
+    }
+}
+
+fn infer_binary_result(operator: BinaryOperator, left: Ty, right: Ty) -> Ty {
+    let compatible =
+        left.conversion_rank_to(&right).is_some() || right.conversion_rank_to(&left).is_some();
+    match operator {
+        BinaryOperator::ShortCircuitOr | BinaryOperator::ShortCircuitAnd => {
+            if left.is_bool() && right.is_bool() {
+                Ty::Bool
+            } else {
+                Ty::Unknown
+            }
+        }
+        BinaryOperator::Equality | BinaryOperator::Inequality => {
+            if !compatible {
+                Ty::Unknown
+            } else if let Ty::Vector(size, _) = left {
+                Ty::Vector(size, Box::new(Ty::Bool))
+            } else {
+                Ty::Bool
+            }
+        }
+        BinaryOperator::LessThan
+        | BinaryOperator::LessThanEqual
+        | BinaryOperator::GreaterThan
+        | BinaryOperator::GreaterThanEqual => {
+            if !left.is_numeric() || !right.is_numeric() || !compatible {
+                Ty::Unknown
+            } else if let Ty::Vector(size, _) = left {
+                Ty::Vector(size, Box::new(Ty::Bool))
+            } else {
+                Ty::Bool
+            }
+        }
+        BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => {
+            if left.is_integer() && right.is_integer() {
+                left
+            } else {
+                Ty::Unknown
+            }
+        }
+        BinaryOperator::BitwiseOr | BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseXor => {
+            let bools = matches!((&left, &right), (Ty::Bool, Ty::Bool))
+                || matches!(
+                    (&left, &right),
+                    (Ty::Vector(_, left), Ty::Vector(_, right))
+                        if left.is_bool() && right.is_bool()
+                );
+            if compatible && (bools || left.is_integer() && right.is_integer()) {
+                unify_numeric(left, right)
+            } else {
+                Ty::Unknown
+            }
+        }
+        BinaryOperator::Multiplication if left.is_numeric() && right.is_numeric() => {
+            infer_multiplication(left, right)
+        }
+        BinaryOperator::Addition
+        | BinaryOperator::Subtraction
+        | BinaryOperator::Division
+        | BinaryOperator::Remainder => {
+            if left.is_numeric() && right.is_numeric() {
+                unify_numeric(left, right)
+            } else {
+                Ty::Unknown
+            }
+        }
+        BinaryOperator::Multiplication => Ty::Unknown,
+    }
+}
+
+fn infer_multiplication(left: Ty, right: Ty) -> Ty {
+    match (left, right) {
+        (Ty::Matrix(columns, rows, element), Ty::Vector(size, vector_element))
+            if columns == size =>
+        {
+            Ty::Vector(rows, Box::new(unify_numeric(*element, *vector_element)))
+        }
+        (Ty::Vector(size, vector_element), Ty::Matrix(columns, rows, element)) if size == rows => {
+            Ty::Vector(columns, Box::new(unify_numeric(*vector_element, *element)))
+        }
+        (
+            Ty::Matrix(left_columns, left_rows, left_element),
+            Ty::Matrix(right_columns, right_rows, right_element),
+        ) if left_columns == right_rows => Ty::Matrix(
+            right_columns,
+            left_rows,
+            Box::new(unify_numeric(*left_element, *right_element)),
+        ),
+        (left, right) => unify_numeric(left, right),
+    }
 }
 
 fn is_swizzle(name: &str) -> bool {
@@ -1012,6 +1642,23 @@ mod tests {
     use wgsl_parse::parse_str;
 
     use super::check_module;
+
+    #[test]
+    fn infers_expression_from_editor_local_types() {
+        let module = parse_str("fn f() {}").unwrap();
+        let expression = "v".parse().unwrap();
+        let local_types =
+            std::collections::HashMap::from([("v".to_owned(), "vec3<f32>".to_owned())]);
+        assert_eq!(
+            super::infer_expression_type(
+                &module,
+                expression,
+                &local_types,
+                super::TypeEnvironment::default(),
+            ),
+            super::Ty::Vector(3, Box::new(super::Ty::F32))
+        );
+    }
 
     fn naga_accepts(source: &str) -> bool {
         let Ok(module) = naga::front::wgsl::parse_str(source) else {
@@ -1060,6 +1707,8 @@ mod tests {
             "struct S { x: f32, } fn f(s: S) { let x: f32 = s.x; }",
             "fn g(x: f32) -> f32 { return x; } fn f() { let x: f32 = g(1.0); }",
             "fn f() { var x: f32 = 1.0; x = 2.0; }",
+            "@vertex fn f(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { return vec4f(f32(i)); }",
+            "const N = 1u + 1u; @compute @workgroup_size(N) fn f() { var values: array<f32, N>; values[0] = 1.0; }",
         ];
         for source in valid {
             let module = parse_str(source).unwrap();
@@ -1078,6 +1727,20 @@ mod tests {
             "fn f() { let x: vec4<f32> = vec2(1.0); }",
             "fn f() { let x: f32 = vec2(1.0).x; let y: bool = x; }",
             "fn f() { let x: bool = vec2(1.0).x; }",
+            "fn f() { let x = sin(true); }",
+            "fn f() { let x = dot(vec3(1.0), vec2(1.0)); }",
+            "fn f() { let x = select(1.0, 2.0, 1.0); }",
+            "fn f() { let x = true + false; }",
+            "fn f() { let x = ~1.0; }",
+            "fn f() { let x = 1.0 << 1; }",
+            "fn f() { let x = vec4(vec2(1.0)); }",
+            "struct S { x: f32, } fn f() { let x = S(true); }",
+            "fn f() { let x = vec3<f32>(1.0, true, 2.0); }",
+            "fn f() { var x = true; x += true; }",
+            "fn f() { var x: f32 = 1.0; x &= 1.0; }",
+            "fn f() { var x: i32 = 1; x += 1.0; }",
+            "@vertex fn f() -> @builtin(position) bool { return true; }",
+            "@compute @workgroup_size(0) fn f() {}",
         ];
         for source in invalid {
             let module = parse_str(source).unwrap();

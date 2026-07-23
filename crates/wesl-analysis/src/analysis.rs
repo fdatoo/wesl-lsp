@@ -120,7 +120,12 @@ impl AnalysisHost {
     }
 
     pub fn diagnostics(&mut self, path: &Path) -> Vec<Diagnostic> {
-        let Some(document) = self.documents.get(path).cloned() else {
+        let document = self.documents.get(path).cloned().or_else(|| {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|source| Document::parse(source, None))
+        });
+        let Some(document) = document else {
             return Vec::new();
         };
         if let Some(error) = &document.parse_error {
@@ -204,7 +209,8 @@ impl AnalysisHost {
             }
         }
         if diagnostics.is_empty() {
-            diagnostics.extend(crate::check_module(module).into_iter().map(|diagnostic| {
+            let type_diagnostics = self.ensure_package(path).type_diagnostics(path, module);
+            diagnostics.extend(type_diagnostics.into_iter().map(|diagnostic| {
                 Diagnostic {
                     range: clamp_range(diagnostic.range, document.source.len()),
                     severity: DiagnosticSeverity::Error,
@@ -232,6 +238,17 @@ impl AnalysisHost {
     ) -> Vec<Location> {
         self.ensure_package(path)
             .references(path, offset, include_declaration)
+    }
+
+    pub fn diagnostic_batch(&mut self, path: &Path) -> Vec<(PathBuf, Vec<Diagnostic>)> {
+        let paths = self.ensure_package(path).import_closure(path);
+        paths
+            .into_iter()
+            .map(|path| {
+                let diagnostics = self.diagnostics(&path);
+                (path, diagnostics)
+            })
+            .collect()
     }
 
     pub fn rename(
@@ -377,6 +394,55 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_batch_covers_import_closure() {
+        let temp = tempdir().unwrap();
+        let dependency = temp.path().join("dependency.wesl");
+        let dependency_source = "fn broken() { let value: bool = 1.0; }\n";
+        fs::write(&dependency, dependency_source).unwrap();
+        let root = temp.path().join("root.wesl");
+        let root_source = "import package::dependency::broken;\nfn main() { broken(); }\n";
+        fs::write(&root, root_source).unwrap();
+
+        let mut host = AnalysisHost::default();
+        host.open(root.clone(), root_source.into());
+        let batch = host.diagnostic_batch(&root);
+
+        assert_eq!(batch.len(), 2, "{batch:#?}");
+        assert_eq!(batch[0], (root, Vec::new()));
+        assert_eq!(batch[1].0, dependency);
+        assert_eq!(batch[1].1.len(), 1);
+        assert_eq!(
+            batch[1].1[0].message,
+            "type mismatch: expected bool, found f32"
+        );
+    }
+
+    #[test]
+    fn imported_function_and_struct_types_are_checked() {
+        let temp = tempdir().unwrap();
+        let types_path = temp.path().join("types.wesl");
+        let types_source = "struct Item { value: f32, }\nfn make() -> Item { return Item(1.0); }\nfn scalar() -> f32 { return 1.0; }\n";
+        fs::write(&types_path, types_source).unwrap();
+        let path = temp.path().join("main.wesl");
+        let source = "import package::types::{make, scalar as get_scalar, Item as ImportedItem};\nfn use_item(value: ImportedItem) { let x: f32 = value.value; }\nfn main() { let item = make(); let x: f32 = item.value; let bad: bool = get_scalar(); }\n";
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::default();
+        host.open(path.clone(), source.into());
+
+        let diagnostics = host.diagnostics(&path);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "type mismatch: expected bool, found f32"
+        );
+
+        let edited = source.replace("let bad: bool = get_scalar();", "make().");
+        host.change(&path, edited.clone());
+        let items = host.completions(&path, edited.rfind("make().").unwrap() + 7);
+        assert!(items.iter().any(|item| item.label == "value"), "{items:#?}");
+    }
+
+    #[test]
     fn builtin_rename_is_rejected() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("shader.wesl");
@@ -395,7 +461,7 @@ mod tests {
     fn member_completions_use_last_good_types() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("shader.wesl");
-        let good = "struct Item { value: f32, }\nfn main() { let v: vec3<f32> = vec3(0.0); let item: Item; let q = v; }";
+        let good = "struct Item { value: f32, }\nfn make() -> Item { return Item(1.0); }\nfn main() { let v: vec3<f32> = vec3(0.0); var item: Item; let q = v; }";
         fs::write(&path, good).unwrap();
         let mut host = AnalysisHost::default();
         host.open(path.clone(), good.into());
@@ -407,6 +473,11 @@ mod tests {
         assert!(vector_items.iter().any(|item| item.label == "x"));
         assert!(vector_items.iter().any(|item| item.label == "xyz"));
 
+        let binary_edit = good.replace("let q = v;", "(v + v).");
+        host.change(&path, binary_edit.clone());
+        let binary_items = host.completions(&path, binary_edit.find("(v + v).").unwrap() + 8);
+        assert!(binary_items.iter().any(|item| item.label == "zyxx"));
+
         let struct_edit = good.replace("let q = v;", "item.");
         host.change(&path, struct_edit.clone());
         let struct_items = host.completions(&path, struct_edit.find("item.").unwrap() + 5);
@@ -414,6 +485,52 @@ mod tests {
             struct_items.iter().any(|item| item.label == "value"),
             "{struct_items:#?}"
         );
+
+        let call_edit = good.replace("let q = v;", "make().");
+        host.change(&path, call_edit.clone());
+        let call_items = host.completions(&path, call_edit.find("make().").unwrap() + 7);
+        assert!(call_items.iter().any(|item| item.label == "value"));
+    }
+
+    #[test]
+    fn nested_shadow_does_not_escape_its_block() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("shader.wesl");
+        let source = "fn f() { let x = 1; { let x = 2; let y = x; } let z = x; }";
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::default();
+        host.open(path.clone(), source.into());
+
+        let final_use = source.rfind("x;").unwrap();
+        let definition = host.definition(&path, final_use).unwrap();
+        assert_eq!(definition.range.start, source.find("x = 1").unwrap());
+    }
+
+    #[test]
+    fn branch_local_does_not_escape_to_sibling() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("shader.wesl");
+        let source =
+            "fn f(condition: bool) { if condition { let branch = 1; } else { let x = branch; } }";
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::default();
+        host.open(path.clone(), source.into());
+
+        let escaped_use = source.rfind("branch;").unwrap();
+        assert!(host.definition(&path, escaped_use).is_none());
+    }
+
+    #[test]
+    fn for_initializer_does_not_escape_loop() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("shader.wesl");
+        let source = "fn f() { for (var i = 0; i < 2; i++) {} let x = i; }";
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::default();
+        host.open(path.clone(), source.into());
+
+        let escaped_use = source.rfind("i;").unwrap();
+        assert!(host.definition(&path, escaped_use).is_none());
     }
 
     #[test]

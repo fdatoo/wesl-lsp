@@ -11,4 +11,5 @@ log.workspace = true
 wgsl-parse.workspace = true
 
 [dev-dependencies]
+env_logger.workspace = true
 walkdir.workspace = true

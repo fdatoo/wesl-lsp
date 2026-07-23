@@ -21,3 +21,6 @@ serde.workspace = true
 serde_json.workspace = true
 wesl-analysis = { path = "../wesl-analysis" }
 wesl-fmt = { path = "../wesl-fmt" }
+
+[dev-dependencies]
+tempfile.workspace = true

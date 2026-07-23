@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "wesl-analysis"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
  "naga",
@@ -1449,8 +1449,9 @@ dependencies = [
 
 [[package]]
 name = "wesl-fmt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "env_logger",
  "log",
  "walkdir",
  "wgsl-parse",
@@ -1458,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "wesl-lsp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1468,6 +1469,7 @@ dependencies = [
  "lsp-types",
  "serde",
  "serde_json",
+ "tempfile",
  "wesl-analysis",
  "wesl-fmt",
 ]
@@ -1557,7 +1559,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde_json",

@@ -1,19 +1,21 @@
 use std::{
-    collections::HashMap,
+    borrow::Cow,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use lsp_server::{Connection, Message, Notification, Request, Response};
+use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    Diagnostic as LspDiagnostic, DiagnosticOptions, DiagnosticRelatedInformation,
-    DiagnosticServerCapabilities, DiagnosticSeverity as LspDiagnosticSeverity,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InsertTextFormat,
+    ConfigurationItem, ConfigurationParams, Diagnostic as LspDiagnostic, DiagnosticOptions,
+    DiagnosticRelatedInformation, DiagnosticServerCapabilities,
+    DiagnosticSeverity as LspDiagnosticSeverity, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InsertTextFormat,
     Location as LspLocation, MarkupContent, MarkupKind, OneOf, Position as LspPosition,
     PublishDiagnosticsParams, Range as LspRange, ReferenceParams, RenameOptions, RenameParams,
     ServerCapabilities, SymbolKind as LspSymbolKind, TextDocumentSyncCapability,
@@ -24,7 +26,7 @@ use lsp_types::{
     },
     request::{
         Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, References,
-        Rename, Request as RequestTrait,
+        Rename, Request as RequestTrait, WorkspaceConfiguration,
     },
 };
 use serde::Deserialize;
@@ -46,12 +48,28 @@ fn main() -> Result<()> {
     let (connection, io_threads) = Connection::stdio();
     let (initialize_id, initialize_params) = connection.initialize_start()?;
     let initialize_params: InitializeParams = serde_json::from_value(initialize_params)?;
-    let options: InitializationOptions = initialize_params
+    let supports_configuration = initialize_params
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.configuration)
+        .unwrap_or(false);
+    #[allow(deprecated)]
+    let configuration_scope = initialize_params
+        .workspace_folders
+        .as_ref()
+        .and_then(|folders| folders.first())
+        .map(|folder| folder.uri.clone())
+        .or_else(|| initialize_params.root_uri.clone());
+    let mut options: InitializationOptions = initialize_params
         .initialization_options
         .map(serde_json::from_value)
         .transpose()
         .context("invalid initializationOptions")?
         .unwrap_or_default();
+    options.root = options
+        .root
+        .map(|root| resolve_workspace_root(root, configuration_scope.as_ref()));
     let result = InitializeResult {
         capabilities: capabilities(),
         server_info: Some(lsp_types::ServerInfo {
@@ -60,12 +78,19 @@ fn main() -> Result<()> {
         }),
     };
     connection.initialize_finish(initialize_id, serde_json::to_value(result)?)?;
+    let mut startup_messages = VecDeque::new();
+    if options.root.is_none() && supports_configuration {
+        let (root, queued) = request_workspace_root(&connection, configuration_scope.clone())?;
+        options.root = root;
+        startup_messages = queued;
+    }
 
     let mut server = Server {
         connection: &connection,
         analysis: AnalysisHost::new(options.root),
         versions: HashMap::new(),
         pending: HashMap::new(),
+        startup_messages,
         log_timing,
     };
     server.run()?;
@@ -73,6 +98,63 @@ fn main() -> Result<()> {
     drop(connection);
     io_threads.join()?;
     Ok(())
+}
+
+fn request_workspace_root(
+    connection: &Connection,
+    scope_uri: Option<Url>,
+) -> Result<(Option<PathBuf>, VecDeque<Message>)> {
+    let id = RequestId::from("wesl-lsp/workspace-configuration".to_owned());
+    let request = Request::new(
+        id.clone(),
+        WorkspaceConfiguration::METHOD.to_owned(),
+        ConfigurationParams {
+            items: vec![ConfigurationItem {
+                scope_uri: scope_uri.clone(),
+                section: Some("wesl-lsp".to_owned()),
+            }],
+        },
+    );
+    connection.sender.send(Message::Request(request))?;
+
+    let mut queued = VecDeque::new();
+    loop {
+        let message = connection
+            .receiver
+            .recv()
+            .context("client disconnected before workspace/configuration response")?;
+        if let Message::Response(response) = &message
+            && response.id == id
+        {
+            let root = response
+                .result
+                .as_ref()
+                .and_then(|result| result.as_array())
+                .and_then(|values| values.first())
+                .and_then(configuration_root)
+                .map(|root| resolve_workspace_root(root, scope_uri.as_ref()));
+            return Ok((root, queued));
+        }
+        queued.push_back(message);
+    }
+}
+
+fn configuration_root(value: &serde_json::Value) -> Option<PathBuf> {
+    value
+        .get("root")
+        .or_else(|| value.get("initializationOptions")?.get("root"))
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+}
+
+fn resolve_workspace_root(root: PathBuf, scope_uri: Option<&Url>) -> PathBuf {
+    if root.is_absolute() {
+        return root;
+    }
+    scope_uri
+        .and_then(|uri| uri.to_file_path().ok())
+        .map(|scope| scope.join(&root))
+        .unwrap_or(root)
 }
 
 fn capabilities() -> ServerCapabilities {
@@ -103,13 +185,16 @@ struct Server<'a> {
     analysis: AnalysisHost,
     versions: HashMap<PathBuf, i32>,
     pending: HashMap<PathBuf, Instant>,
+    startup_messages: VecDeque<Message>,
     log_timing: bool,
 }
 
 impl Server<'_> {
     fn run(&mut self) -> Result<()> {
         loop {
-            let message = if let Some(deadline) = self.pending.values().min().copied() {
+            let message = if let Some(message) = self.startup_messages.pop_front() {
+                Some(message)
+            } else if let Some(deadline) = self.pending.values().min().copied() {
                 let timeout = deadline.saturating_duration_since(Instant::now());
                 match self.connection.receiver.recv_timeout(timeout) {
                     Ok(message) => Some(message),
@@ -360,8 +445,10 @@ impl Server<'_> {
 
     fn publish(&mut self, path: &Path) -> Result<()> {
         let started = Instant::now();
-        let diagnostics = self.analysis.diagnostics(path);
-        self.send_diagnostics(path, diagnostics)?;
+        let batch = self.analysis.diagnostic_batch(path);
+        for (diagnostic_path, diagnostics) in batch {
+            self.send_diagnostics(&diagnostic_path, diagnostics)?;
+        }
         if self.log_timing {
             log::info!(
                 "diagnostics for {} completed in {:?}",
@@ -377,19 +464,24 @@ impl Server<'_> {
         path: &Path,
         diagnostics: Vec<wesl_analysis::Diagnostic>,
     ) -> Result<()> {
-        let source = self.analysis.source(path).unwrap_or_default();
-        let lines = LineIndex::new(source);
+        let source = self
+            .analysis
+            .source(path)
+            .map(Cow::Borrowed)
+            .or_else(|| std::fs::read_to_string(path).ok().map(Cow::Owned))
+            .unwrap_or_default();
+        let lines = LineIndex::new(&source);
         let diagnostics = diagnostics
             .into_iter()
             .map(|diagnostic| {
                 let start = lines
-                    .offset_to_position(source, diagnostic.range.start)
+                    .offset_to_position(&source, diagnostic.range.start)
                     .unwrap_or(wesl_analysis::Position {
                         line: 0,
                         character: 0,
                     });
                 let end = lines
-                    .offset_to_position(source, diagnostic.range.end)
+                    .offset_to_position(&source, diagnostic.range.end)
                     .unwrap_or(start);
                 let related_information = (!diagnostic.related.is_empty()).then(|| {
                     diagnostic
@@ -398,8 +490,8 @@ impl Server<'_> {
                         .filter_map(|(related_path, related_range, message)| {
                             let range = if related_path == path {
                                 let start =
-                                    lines.offset_to_position(source, related_range.start)?;
-                                let end = lines.offset_to_position(source, related_range.end)?;
+                                    lines.offset_to_position(&source, related_range.start)?;
+                                let end = lines.offset_to_position(&source, related_range.end)?;
                                 LspRange::new(
                                     LspPosition::new(start.line, start.character),
                                     LspPosition::new(end.line, end.character),

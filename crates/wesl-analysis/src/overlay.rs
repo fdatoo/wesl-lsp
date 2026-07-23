@@ -73,3 +73,34 @@ impl Resolver for OverlayResolver {
         self.source_path(path).or_else(|| self.files.fs_path(path))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+    use wesl::Resolver;
+    use wgsl_parse::parse_str;
+
+    use super::OverlayResolver;
+
+    #[test]
+    fn package_imports_read_dirty_buffers_before_disk() {
+        let temp = tempdir().unwrap();
+        let dependency = temp.path().join("dependency.wesl");
+        fs::write(&dependency, "const value = 1;").unwrap();
+        let import = parse_str("import package::dependency::value;")
+            .unwrap()
+            .imports[0]
+            .path
+            .clone()
+            .unwrap();
+        let mut resolver = OverlayResolver::new(temp.path());
+        resolver.set_buffer(dependency, "const value = 2;".to_owned());
+
+        assert_eq!(
+            resolver.resolve_source(&import).unwrap(),
+            "const value = 2;"
+        );
+    }
+}

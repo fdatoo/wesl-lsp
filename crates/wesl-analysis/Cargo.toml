@@ -17,4 +17,4 @@ wgsl-types.workspace = true
 
 [dev-dependencies]
 naga = { version = "30.0.0", features = ["wgsl-in"] }
-tempfile = "3.20.0"
+tempfile.workspace = true

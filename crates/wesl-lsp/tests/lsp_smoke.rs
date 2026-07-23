@@ -7,6 +7,7 @@ use std::{
 
 use serde_json::{Value, json};
 
+use tempfile::tempdir;
 struct Client {
     child: Child,
     input: Option<ChildStdin>,
@@ -62,13 +63,40 @@ impl Client {
         serde_json::from_slice(&body).unwrap()
     }
 
+    fn receive_response(&mut self, id: i64) -> Value {
+        loop {
+            let message = self.receive();
+            if message["id"] == id {
+                return message;
+            }
+        }
+    }
+
+    fn receive_diagnostics(&mut self, uri: &lsp_types::Url) -> Value {
+        let expected_path = uri.to_file_path().unwrap().canonicalize().unwrap();
+        loop {
+            let message = self.receive();
+            if message["method"].as_str() == Some("textDocument/publishDiagnostics")
+                && message["params"]["uri"]
+                    .as_str()
+                    .and_then(|uri| lsp_types::Url::parse(uri).ok())
+                    .and_then(|uri| uri.to_file_path().ok())
+                    .and_then(|path| path.canonicalize().ok())
+                    .is_some_and(|path| path == expected_path)
+            {
+                return message;
+            }
+        }
+    }
+
     fn shutdown(&mut self) {
         eprintln!("sending shutdown");
         self.send(json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}));
-        let response = self.receive();
+        let response = self.receive_response(99);
         assert_eq!(response["id"], 99);
         self.send(json!({"jsonrpc": "2.0", "method": "exit"}));
         self.input.take();
+
         eprintln!("waiting for server exit");
         assert!(self.child.wait().unwrap().success());
     }
@@ -95,6 +123,58 @@ fn position(source: &str, offset: usize) -> Value {
 }
 
 #[test]
+fn requests_workspace_configuration_when_initialization_root_is_absent() {
+    let temp = tempdir().unwrap();
+    let workspace = temp.path();
+    let shaders = workspace.join("shaders");
+    fs::create_dir(&shaders).unwrap();
+    fs::write(shaders.join("wesl.toml"), "").unwrap();
+    fs::write(workspace.join("shared.wesl"), "const value: f32 = 1.0;\n").unwrap();
+    let path = shaders.join("main.wesl");
+    let source = "import package::shared::value;\nfn main() { let x: f32 = value; }\n";
+    fs::write(&path, source).unwrap();
+    let workspace_uri = lsp_types::Url::from_file_path(workspace).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+
+    let mut client = Client::start();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {"workspace": {"configuration": true}},
+            "workspaceFolders": [{"uri": workspace_uri, "name": "workspace"}]
+        }
+    }));
+    assert_eq!(client.receive_response(1)["id"], 1);
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    let configuration = client.receive();
+    assert_eq!(configuration["method"], "workspace/configuration");
+    assert_eq!(configuration["params"]["items"][0]["section"], "wesl-lsp");
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": configuration["id"].clone(),
+        "result": [{"root": "."}]
+    }));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": uri,
+                "languageId": "wesl",
+                "version": 1,
+                "text": source
+            }
+        }
+    }));
+
+    let diagnostics = client.receive_diagnostics(&uri);
+    assert_eq!(diagnostics["params"]["diagnostics"], json!([]));
+    client.shutdown();
+}
+
+#[test]
 fn publishes_clean_then_isolated_import_diagnostics() {
     let shader_root = shaders();
     if !shader_root.is_dir() {
@@ -117,7 +197,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
         }
     }));
     eprintln!("waiting for initialize");
-    let initialized = client.receive();
+    let initialized = client.receive_response(1);
     assert_eq!(initialized["id"], 1);
     client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
     client.send(json!({
@@ -133,7 +213,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
         }
     }));
     eprintln!("waiting for clean diagnostics");
-    let clean = client.receive();
+    let clean = client.receive_diagnostics(&uri);
     assert_eq!(clean["method"], "textDocument/publishDiagnostics");
     assert_eq!(clean["params"]["diagnostics"], json!([]));
 
@@ -147,7 +227,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
         }
     }));
     eprintln!("waiting for changed diagnostics");
-    let diagnostics = client.receive();
+    let diagnostics = client.receive_diagnostics(&uri);
     eprintln!("received changed diagnostics");
     assert_eq!(diagnostics["method"], "textDocument/publishDiagnostics");
     let diagnostics = diagnostics["params"]["diagnostics"].as_array().unwrap();
@@ -176,7 +256,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
         }
     }));
     assert_eq!(
-        client.receive()["params"]["diagnostics"],
+        client.receive_diagnostics(&clouds_uri)["params"]["diagnostics"],
         json!([]),
         "clouds_map.wesl should be clean"
     );
@@ -192,7 +272,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
             "position": call_position
         }
     }));
-    let definition = client.receive();
+    let definition = client.receive_response(2);
     assert_eq!(definition["id"], 2);
     assert!(
         definition["result"]["uri"]
@@ -212,7 +292,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
             "context": {"includeDeclaration": true}
         }
     }));
-    let references = client.receive();
+    let references = client.receive_response(3);
     assert_eq!(references["id"], 3);
     assert!(references["result"].as_array().unwrap().len() >= 4);
 
@@ -226,7 +306,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
             "newName": "wx_coverage_renamed"
         }
     }));
-    let rename = client.receive();
+    let rename = client.receive_response(4);
     assert_eq!(rename["id"], 4);
     assert!(rename["result"]["changes"].as_object().unwrap().len() >= 4);
 
@@ -236,7 +316,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
         "method": "textDocument/documentSymbol",
         "params": {"textDocument": {"uri": clouds_uri}}
     }));
-    let symbols = client.receive();
+    let symbols = client.receive_response(5);
     assert_eq!(symbols["id"], 5);
     assert!(!symbols["result"].as_array().unwrap().is_empty());
 
@@ -249,7 +329,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
             "position": call_position
         }
     }));
-    let hover = client.receive();
+    let hover = client.receive_response(6);
     assert_eq!(hover["id"], 6);
     assert!(
         hover["result"]["contents"]["value"]
@@ -267,7 +347,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
             "position": call_position
         }
     }));
-    let completion = client.receive();
+    let completion = client.receive_response(7);
     assert_eq!(completion["id"], 7);
     let items = completion["result"].as_array().unwrap();
     assert!(items.iter().any(|item| item["label"] == "wx_coverage"));
@@ -295,7 +375,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
             }
         }
     }));
-    let type_diagnostics = client.receive();
+    let type_diagnostics = client.receive_diagnostics(&terrain_uri);
     let type_diagnostics = type_diagnostics["params"]["diagnostics"]
         .as_array()
         .unwrap();
@@ -327,7 +407,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
             }
         }
     }));
-    let blit_diagnostics = client.receive();
+    let blit_diagnostics = client.receive_diagnostics(&blit_uri);
     assert!(
         blit_diagnostics["params"]["diagnostics"]
             .as_array()
@@ -343,13 +423,13 @@ fn publishes_clean_then_isolated_import_diagnostics() {
             "options": {"tabSize": 2, "insertSpaces": true}
         }
     }));
-    let formatted = client.receive();
+    let formatted = client.receive_response(8);
     assert_eq!(formatted["id"], 8);
     let formatted = formatted["result"][0]["newText"]
         .as_str()
         .unwrap()
         .to_owned();
-    assert!(formatted.contains("\n  @builtin(position) clip_position"));
+    assert!(formatted.contains("\n  @builtin(position)\n  clip_position"));
     assert!(formatted.contains("// Present blit for the windowed path."));
     client.send(json!({
         "jsonrpc": "2.0",
@@ -368,7 +448,7 @@ fn publishes_clean_then_isolated_import_diagnostics() {
             "options": {"tabSize": 2, "insertSpaces": true}
         }
     }));
-    let idempotent = client.receive();
+    let idempotent = client.receive_response(9);
     assert_eq!(idempotent["id"], 9);
     assert!(idempotent["result"].is_null());
 
