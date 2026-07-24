@@ -410,30 +410,10 @@ impl PackageIndex {
         let Some(dot) = prefix.len().checked_sub(1) else {
             return Vec::new();
         };
-        let Some(base_source) = member_base_source(&file.source, dot) else {
+        let Some(base_type) = self.infer_member_base_type(path, file, dot) else {
             return Vec::new();
         };
-        let Ok(expression) = base_source.parse::<Expression>() else {
-            return Vec::new();
-        };
-        let Some(module) = file.module.as_deref() else {
-            return Vec::new();
-        };
-        let mut visible = file
-            .locals
-            .iter()
-            .filter(|local| local.range.start <= dot && local.scope_range.contains(&dot))
-            .collect::<Vec<_>>();
-        visible.sort_by_key(|local| local.range.start);
-        let mut local_types = HashMap::new();
-        for local in visible {
-            if let Some(type_name) = declared_type_name(&file.source, local.name.as_str(), dot) {
-                local_types.insert(local.name.to_string(), type_name);
-            }
-        }
-        let mut active = HashSet::from([path.to_path_buf()]);
-        let imports = self.imported_type_environment(file, &mut active);
-        match infer_expression_type(module, expression, &local_types, imports) {
+        match base_type {
             Ty::Vector(size, _) => swizzle_labels(size)
                 .into_iter()
                 .map(|label| Completion {
@@ -456,6 +436,103 @@ impl PackageIndex {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    fn infer_member_base_type(&self, path: &Path, file: &FileIndex, dot: usize) -> Option<Ty> {
+        let base_source = member_base_source(&file.source, dot)?;
+        let expression = base_source.parse::<Expression>().ok()?;
+        let module = file.module.as_deref()?;
+        let mut visible = file
+            .locals
+            .iter()
+            .filter(|local| local.range.start <= dot && local.scope_range.contains(&dot))
+            .collect::<Vec<_>>();
+        visible.sort_by_key(|local| local.range.start);
+        let mut local_types = HashMap::new();
+        for local in visible {
+            if let Some(type_name) = declared_type_name(&file.source, local.name.as_str(), dot) {
+                local_types.insert(local.name.to_string(), type_name);
+            }
+        }
+        let mut active = HashSet::from([path.to_path_buf()]);
+        let imports = self.imported_type_environment(file, &mut active);
+        Some(infer_expression_type(
+            module,
+            expression,
+            &local_types,
+            imports,
+        ))
+    }
+
+    fn resolve_member_usage(
+        &self,
+        path: &Path,
+        file: &FileIndex,
+        name: &str,
+        offset: usize,
+    ) -> Option<Symbol> {
+        let dot = dot_before_identifier(&file.source, offset)?;
+        let Ty::Struct(struct_name, _) = self.infer_member_base_type(path, file, dot)? else {
+            return None;
+        };
+        self.resolve_struct_field(file, &struct_name, name)
+    }
+
+    fn resolve_struct_field(
+        &self,
+        file: &FileIndex,
+        struct_name: &str,
+        field_name: &str,
+    ) -> Option<Symbol> {
+        let find_field = |file: &FileIndex, name: &str| {
+            file.symbols
+                .iter()
+                .find(|symbol| symbol.kind == SymbolKind::Struct && symbol.name == name)
+                .and_then(|symbol| {
+                    symbol
+                        .children
+                        .iter()
+                        .find(|field| field.name == field_name)
+                })
+                .cloned()
+        };
+        if let Some(field) = find_field(file, struct_name) {
+            return Some(field);
+        }
+        for binding in &file.imports {
+            if binding.local_name != struct_name && binding.original_name != struct_name {
+                continue;
+            }
+            if let Some(target_path) = self.module_file(&binding.module)
+                && let Some(field) = self
+                    .files
+                    .get(&target_path)
+                    .and_then(|target| find_field(target, binding.original_name.as_str()))
+            {
+                return Some(field);
+            }
+        }
+        for (import, _) in &file.oil_imports {
+            if let Some((target_path, _)) = self.oil_definition(import)
+                && let Some(field) = self
+                    .files
+                    .get(target_path)
+                    .and_then(|target| find_field(target, struct_name))
+            {
+                return Some(field);
+            }
+        }
+        None
+    }
+
+    fn field_declaration_at(&self, file: &FileIndex, name: &str, offset: usize) -> Option<Symbol> {
+        file.symbols
+            .iter()
+            .flat_map(|symbol| &symbol.children)
+            .find(|field| {
+                field.name == name && field.range.start <= offset && offset <= field.range.end
+            })
+            .cloned()
     }
 
     pub(crate) fn type_diagnostics(
@@ -583,6 +660,12 @@ impl PackageIndex {
 
     fn resolve(&self, path: &Path, name: &str, offset: usize) -> Option<Symbol> {
         let file = self.files.get(path)?;
+        if let Some(field) = self.field_declaration_at(file, name, offset) {
+            return Some(field);
+        }
+        if let Some(field) = self.resolve_member_usage(path, file, name, offset) {
+            return Some(field);
+        }
         if let Some(local) = file
             .locals
             .iter()
@@ -1039,6 +1122,12 @@ fn collect_statement_locals(
     }
 }
 
+fn dot_before_identifier(source: &str, offset: usize) -> Option<usize> {
+    let prefix = source.get(..offset)?;
+    let trimmed = prefix.trim_end();
+    trimmed.ends_with('.').then(|| trimmed.len() - 1)
+}
+
 fn member_base_source(source: &str, dot: usize) -> Option<&str> {
     if source.as_bytes().get(dot) != Some(&b'.') {
         return None;
@@ -1133,10 +1222,15 @@ fn declared_type_name(source: &str, name: &str, before: usize) -> Option<String>
 }
 
 fn identifier_at(source: &str, offset: usize) -> Option<String> {
-    identifier_ranges(source, "")
+    let identifiers = tokens(source)
         .into_iter()
-        .find(|range| range.start <= offset && offset <= range.end)
-        .map(|range| source[range].to_owned())
+        .filter(|(token, _)| is_identifier(token))
+        .collect::<Vec<_>>();
+    identifiers
+        .iter()
+        .find(|(_, range)| range.start <= offset && offset < range.end)
+        .or_else(|| identifiers.iter().find(|(_, range)| range.end == offset))
+        .map(|(token, _)| (*token).to_owned())
 }
 
 fn identifier_ranges(source: &str, expected: &str) -> Vec<Range<usize>> {

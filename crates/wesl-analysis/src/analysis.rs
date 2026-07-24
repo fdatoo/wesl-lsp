@@ -534,6 +534,88 @@ mod tests {
     }
 
     #[test]
+    fn struct_members_have_definitions_and_references() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("shader.wesl");
+        let source = "struct Output { value: f32, }\nfn f(out: Output) { let copy = out.value; }\n";
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::default();
+        host.open(path.clone(), source.into());
+
+        let declaration = source.find("value:").unwrap();
+        let usage = source.rfind("value").unwrap();
+        let completions = host.completions(&path, usage);
+        assert!(
+            completions
+                .iter()
+                .any(|completion| completion.label == "value"),
+            "{completions:#?}"
+        );
+        let symbols = host.document_symbols(&path);
+        let definition = host.definition(&path, usage);
+        assert!(definition.is_some(), "{symbols:#?}");
+        assert_eq!(definition.unwrap().range.start, declaration);
+        let references = host.references(&path, declaration, true);
+        assert_eq!(references.len(), 2, "{references:#?}");
+        assert!(
+            references
+                .iter()
+                .any(|location| location.range.start == usage)
+        );
+    }
+
+    #[test]
+    fn valid_vertex_struct_members_have_no_diagnostics() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("shader.wesl");
+        let source = r#"
+struct Globals {
+    screen: vec2<f32>,
+    _pad: vec2<f32>,
+}
+@group(0) @binding(0) var<uniform> globals: Globals;
+struct VsIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+}
+struct VsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+}
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    let ndc = vec2<f32>(
+        in.pos.x / globals.screen.x * 2.0 - 1.0,
+        1.0 - in.pos.y / globals.screen.y * 2.0,
+    );
+    out.clip = vec4<f32>(ndc, 0.0, 1.0);
+    out.uv = in.uv;
+    out.color = in.color;
+    return out;
+}
+"#;
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::new(Some(temp.path().to_path_buf()));
+        host.open(path.clone(), source.into());
+        assert!(host.diagnostics(&path).is_empty());
+
+        let broken = source.replace("out.uv = in.uv", "out.out = in.uv");
+        host.change(&path, broken.clone());
+        let diagnostics = host.diagnostics(&path);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].message, "type has no member out");
+        let member = broken.find(".out =").unwrap() + 1;
+        assert_eq!(diagnostics[0].range, member..member + 3);
+
+        host.change(&path, source.into());
+        let diagnostics = host.diagnostics(&path);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
     fn naga_oil_imports_navigate_without_type_errors() {
         let temp = tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();

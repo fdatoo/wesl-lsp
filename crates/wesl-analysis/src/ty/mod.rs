@@ -844,8 +844,13 @@ impl Checker<'_> {
                 let base = self.infer_expression(&component.base, locals);
                 let name = component.component.name();
                 member_type(base, &name).unwrap_or_else(|| {
+                    let expression_range = expression.span().range();
+                    let member_end = expression_range.end;
+                    let member_start = member_end
+                        .saturating_sub(name.len())
+                        .max(expression_range.start);
                     self.diagnostics.push(TypeDiagnostic {
-                        range: expression.span().range(),
+                        range: member_start..member_end,
                         message: format!("type has no member {name}"),
                         related: Vec::new(),
                     });
@@ -1747,5 +1752,33 @@ mod tests {
             assert!(!check_module(&module).is_empty(), "checker missed {source}");
             assert!(!naga_accepts(source), "naga accepted {source}");
         }
+    }
+
+    #[test]
+    fn accepts_struct_member_assignments() {
+        let source = r#"
+struct VsIn {
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+}
+struct VsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+}
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    let ndc = vec2<f32>(in.uv.x, 1.0 - in.uv.y);
+    out.clip = vec4<f32>(ndc, 0.0, 1.0);
+    out.uv = in.uv;
+    out.color = in.color;
+    return out;
+}
+"#;
+        let module = parse_str(source).unwrap();
+        let diagnostics = check_module(&module);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(naga_accepts(source));
     }
 }

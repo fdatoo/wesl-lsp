@@ -167,7 +167,10 @@ fn capabilities() -> ServerCapabilities {
         })),
         document_symbol_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
-        completion_provider: Some(CompletionOptions::default()),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![".".to_owned()]),
+            ..CompletionOptions::default()
+        }),
         document_formatting_provider: Some(OneOf::Left(true)),
         ..ServerCapabilities::default()
     }

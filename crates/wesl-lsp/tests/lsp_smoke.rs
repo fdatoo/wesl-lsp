@@ -154,6 +154,10 @@ fn requests_workspace_configuration_when_initialization_root_is_absent() {
             .is_none(),
         "push-only server must not advertise pull diagnostics"
     );
+    assert_eq!(
+        initialized["result"]["capabilities"]["completionProvider"]["triggerCharacters"],
+        json!(["."])
+    );
     client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
     let configuration = client.receive();
     assert_eq!(configuration["method"], "workspace/configuration");
@@ -178,6 +182,117 @@ fn requests_workspace_configuration_when_initialization_root_is_absent() {
 
     let diagnostics = client.receive_diagnostics(&uri);
     assert_eq!(diagnostics["params"]["diagnostics"], json!([]));
+    client.shutdown();
+}
+
+#[test]
+fn struct_members_complete_reference_and_clear_diagnostics() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = "struct Output { value: f32, }\nfn main() { var out: Output; out.value = 1.0; }\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    assert_eq!(client.receive_response(1)["id"], 1);
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": uri,
+                "languageId": "wesl",
+                "version": 1,
+                "text": source
+            }
+        }
+    }));
+    assert_eq!(
+        client.receive_diagnostics(&uri)["params"]["diagnostics"],
+        json!([])
+    );
+
+    let usage = source.rfind("value").unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": {"uri": uri},
+            "position": position(source, usage)
+        }
+    }));
+    let completions = client.receive_response(2);
+    assert!(
+        completions["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["label"] == "value"),
+        "{completions:#?}"
+    );
+
+    let declaration = source.find("value:").unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/references",
+        "params": {
+            "textDocument": {"uri": uri},
+            "position": position(source, declaration),
+            "context": {"includeDeclaration": true}
+        }
+    }));
+    assert_eq!(
+        client.receive_response(3)["result"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let broken = source.replace("out.value", "out.missing");
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": uri, "version": 2},
+            "contentChanges": [{"text": broken}]
+        }
+    }));
+    let diagnostics = client.receive_diagnostics(&uri);
+    let diagnostics = diagnostics["params"]["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["message"], "type has no member missing");
+    assert_eq!(
+        diagnostics[0]["range"]["start"],
+        position(&broken, broken.find("missing").unwrap())
+    );
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": uri, "version": 3},
+            "contentChanges": [{"text": source}]
+        }
+    }));
+    assert_eq!(
+        client.receive_diagnostics(&uri)["params"]["diagnostics"],
+        json!([])
+    );
     client.shutdown();
 }
 
