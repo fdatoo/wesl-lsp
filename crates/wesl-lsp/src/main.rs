@@ -641,6 +641,8 @@ fn document_symbol(path: &Path, symbol: Symbol) -> Option<DocumentSymbol> {
 }
 
 fn uri_path(uri: &Url) -> Result<PathBuf> {
-    uri.to_file_path()
-        .map_err(|_| anyhow::anyhow!("URI is not a file: {uri}"))
+    let path = uri
+        .to_file_path()
+        .map_err(|_| anyhow::anyhow!("URI is not a file: {uri}"))?;
+    Ok(path.canonicalize().unwrap_or(path))
 }

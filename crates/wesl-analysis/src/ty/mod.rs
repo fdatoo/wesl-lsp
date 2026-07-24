@@ -593,8 +593,18 @@ impl Checker<'_> {
         function_declaration: &Range<usize>,
     ) {
         let mut scoped = locals.clone();
+        self.check_compound_in_scope(compound, &mut scoped, return_ty, function_declaration);
+    }
+
+    fn check_compound_in_scope(
+        &mut self,
+        compound: &CompoundStatement,
+        locals: &mut HashMap<String, Ty>,
+        return_ty: &Ty,
+        function_declaration: &Range<usize>,
+    ) {
         for statement in &compound.statements {
-            self.check_statement(statement, &mut scoped, return_ty, function_declaration);
+            self.check_statement(statement, locals, return_ty, function_declaration);
         }
     }
 
@@ -704,16 +714,22 @@ impl Checker<'_> {
                 }
             }
             Statement::Loop(loop_statement) => {
-                self.check_compound(
+                let mut scoped = locals.clone();
+                self.check_compound_in_scope(
                     &loop_statement.body,
-                    locals,
+                    &mut scoped,
                     return_ty,
                     function_declaration,
                 );
                 if let Some(continuing) = &loop_statement.continuing {
-                    self.check_compound(&continuing.body, locals, return_ty, function_declaration);
+                    self.check_compound_in_scope(
+                        &continuing.body,
+                        &mut scoped,
+                        return_ty,
+                        function_declaration,
+                    );
                     if let Some(break_if) = &continuing.break_if {
-                        let ty = self.infer_expression(&break_if.expression, locals);
+                        let ty = self.infer_expression(&break_if.expression, &scoped);
                         self.check_bool(break_if.expression.span().range(), &ty);
                     }
                 }
@@ -831,14 +847,26 @@ impl Checker<'_> {
             }
             Expression::TypeOrIdentifier(ty) => {
                 if ty.path.is_some() {
-                    Ty::Unknown
-                } else {
-                    locals
-                        .get(ty.ident.name().as_str())
-                        .or_else(|| self.types.globals.get(ty.ident.name().as_str()))
-                        .cloned()
-                        .unwrap_or(Ty::Unknown)
+                    return Ty::Unknown;
                 }
+                let name = ty.ident.name();
+                if name.as_str() == "_" {
+                    return Ty::Unknown;
+                }
+                if let Some(ty) = locals
+                    .get(name.as_str())
+                    .or_else(|| self.types.globals.get(name.as_str()))
+                    .cloned()
+                    .or_else(|| predeclared_value_type(name.as_str()))
+                {
+                    return ty;
+                }
+                self.diagnostics.push(TypeDiagnostic {
+                    range: expression.span().range(),
+                    message: format!("unresolved identifier {name}"),
+                    related: Vec::new(),
+                });
+                Ty::Unknown
             }
             Expression::NamedComponent(component) => {
                 let base = self.infer_expression(&component.base, locals);
@@ -1216,6 +1244,17 @@ fn builtin_value_type(value: BuiltinValue) -> Option<Ty> {
         | BuiltinValue::SubgroupInvocationId
         | BuiltinValue::SubgroupSize => None,
     }
+}
+
+fn predeclared_value_type(name: &str) -> Option<Ty> {
+    matches!(
+        name,
+        "RAY_QUERY_INTERSECTION_NONE"
+            | "RAY_QUERY_INTERSECTION_TRIANGLE"
+            | "RAY_QUERY_INTERSECTION_GENERATED"
+            | "RAY_QUERY_INTERSECTION_AABB"
+    )
+    .then_some(Ty::U32)
 }
 
 fn shorthand_scalar(suffix: u8) -> Option<Ty> {
@@ -1689,11 +1728,31 @@ mod tests {
     }
 
     #[test]
-    fn unknown_values_poison_without_cascades() {
-        let module = parse_str(
-            "import package::missing::value; fn main() { let x: f32 = value; let y = x + value; }",
-        )
-        .unwrap();
+    fn unresolved_identifier_is_reported_without_member_cascade() {
+        let source = "fn main() { asdf.sdf++; }";
+        let module = parse_str(source).unwrap();
+        let diagnostics = check_module(&module);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].message, "unresolved identifier asdf");
+        let start = source.find("asdf").unwrap();
+        assert_eq!(diagnostics[0].range, start..start + 4);
+    }
+
+    #[test]
+    fn recognizes_loop_scope_phony_assignment_and_predeclared_values() {
+        let source = r#"
+fn main() {
+    loop {
+        let body_value = 1u;
+        continuing {
+            let continuing_value = body_value;
+            _ = RAY_QUERY_INTERSECTION_NONE;
+            break if continuing_value == 1u;
+        }
+    }
+}
+"#;
+        let module = parse_str(source).unwrap();
         assert!(check_module(&module).is_empty());
     }
 

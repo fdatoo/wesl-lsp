@@ -610,6 +610,14 @@ fn vs_main(in: VsIn) -> VsOut {
         let member = broken.find(".out =").unwrap() + 1;
         assert_eq!(diagnostics[0].range, member..member + 3);
 
+        let unknown = source.replace("out.uv = in.uv", "asdf.sdf++;\n    out.uv = in.uv");
+        host.change(&path, unknown.clone());
+        let diagnostics = host.diagnostics(&path);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].message, "unresolved identifier asdf");
+        let identifier = unknown.find("asdf").unwrap();
+        assert_eq!(diagnostics[0].range, identifier..identifier + 4);
+
         host.change(&path, source.into());
         let diagnostics = host.diagnostics(&path);
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");

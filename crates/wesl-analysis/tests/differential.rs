@@ -56,7 +56,8 @@ fn public_corpus_matches_naga_bidirectionally() {
             continue;
         };
         compared += 1;
-        let checker_error = !check_module(&module).is_empty();
+        let checker_diagnostics = check_module(&module);
+        let checker_error = !checker_diagnostics.is_empty();
         checker_flagged += usize::from(checker_error);
         let naga_result = naga_validate(&source);
         let naga_error = naga_result.is_err();
@@ -69,6 +70,7 @@ fn public_corpus_matches_naga_bidirectionally() {
             mismatches.push((
                 path.to_path_buf(),
                 checker_error,
+                checker_diagnostics,
                 naga_result.err().unwrap_or_default(),
             ));
         }
