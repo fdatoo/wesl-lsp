@@ -296,6 +296,29 @@ pub(crate) fn analyze_module(
     (checker.diagnostics, checker.types)
 }
 
+/// Resolved member types for every struct in the module, for layout computation.
+pub(crate) fn collect_struct_types(
+    module: &TranslationUnit,
+    types: TypeEnvironment,
+) -> Vec<(String, Vec<(String, Ty)>)> {
+    let mut checker = Checker {
+        module,
+        types,
+        diagnostics: Vec::new(),
+        inferred: Vec::new(),
+    };
+    checker.collect_types();
+    checker
+        .types
+        .named
+        .into_iter()
+        .filter_map(|(name, ty)| match ty {
+            Ty::Struct(struct_name, fields) if struct_name == name => Some((name, fields)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Runs the same pass as [`analyze_module`] but keeps the types it inferred for declarations
 /// that had no written annotation, which is exactly what a type inlay hint displays.
 pub(crate) fn inferred_declarations(
@@ -1343,7 +1366,7 @@ fn constructor_shape_valid(constructor: &Ty, arguments: &[Ty]) -> bool {
     }
 }
 
-fn const_u32(module: &TranslationUnit, expression: &ExpressionNode) -> Option<u32> {
+pub(crate) fn const_u32(module: &TranslationUnit, expression: &ExpressionNode) -> Option<u32> {
     let (result, _) = wesl::eval(expression.node(), module);
     match result.ok()? {
         wesl::eval::Instance::Literal(LiteralInstance::AbstractInt(value)) => value.try_into().ok(),

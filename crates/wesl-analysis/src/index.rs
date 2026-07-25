@@ -10,13 +10,14 @@ use crate::{
     builtins::{BUILTIN_FUNCTIONS, BUILTIN_TYPES, builtin},
     dialect,
     inlay::{InlayHint, InlayKind},
+    layout::{MemberOverrides, struct_layout},
     signature::{
         CallSite, SignatureHelp, SignatureInfo, call_sites, enclosing_call, parameter_names,
         parameter_spans,
     },
     ty::{
-        Ty, TypeDiagnostic, TypeEnvironment, analyze_module, infer_expression_type,
-        inferred_declarations,
+        Ty, TypeDiagnostic, TypeEnvironment, analyze_module, collect_struct_types, const_u32,
+        infer_expression_type, inferred_declarations,
     },
 };
 use smol_str::SmolStr;
@@ -24,8 +25,8 @@ use walkdir::WalkDir;
 use wgsl_parse::{
     SyntaxNode, parse_str,
     syntax::{
-        CompoundStatement, Expression, GlobalDeclaration, ImportContent, ImportItem, ModulePath,
-        PathOrigin, Statement, StatementNode, TranslationUnit,
+        Attribute, CompoundStatement, Expression, GlobalDeclaration, ImportContent, ImportItem,
+        ModulePath, PathOrigin, Statement, StatementNode, TranslationUnit,
     },
 };
 
@@ -309,6 +310,7 @@ impl PackageIndex {
         if let Some(module) = file.module.as_deref() {
             let mut active = HashSet::from([path.to_path_buf()]);
             let imports = self.imported_type_environment(file, &mut active);
+            hints.extend(struct_layout_hints(module, imports.clone(), &range));
             for (declaration, name, ty) in inferred_declarations(module, imports) {
                 if let Some(identifier) = find_identifier(&file.source, declaration, &name)
                     && range.contains(&identifier.end)
@@ -1510,6 +1512,77 @@ pub(crate) fn is_identifier(name: &str) -> bool {
         .next()
         .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// One hint per struct member giving its byte offset, alignment and size. Anchored at the end
+/// of the member declaration, so it reads as a trailing annotation on the field.
+fn struct_layout_hints(
+    module: &TranslationUnit,
+    types: TypeEnvironment,
+    range: &Range<usize>,
+) -> Vec<InlayHint> {
+    let overrides = struct_member_overrides(module);
+    let resolved = collect_struct_types(module, types)
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    let mut hints = Vec::new();
+    for declaration in &module.global_declarations {
+        let GlobalDeclaration::Struct(structure) = declaration.node() else {
+            continue;
+        };
+        let name = structure.ident.name().to_string();
+        let Some(fields) = resolved.get(&name) else {
+            continue;
+        };
+        let Some(members) = struct_layout(&name, fields, &overrides) else {
+            continue;
+        };
+        for (member, layout) in structure.members.iter().zip(members) {
+            let anchor = member.span().range().end;
+            if !range.contains(&anchor) {
+                continue;
+            }
+            hints.push(InlayHint {
+                offset: anchor,
+                label: format!(
+                    "offset {}, align {}, size {}",
+                    layout.offset, layout.align, layout.size
+                ),
+                kind: InlayKind::Layout,
+            });
+        }
+    }
+    hints
+}
+
+/// `@align`/`@size` attributes per struct member, in declaration order.
+fn struct_member_overrides(module: &TranslationUnit) -> MemberOverrides {
+    module
+        .global_declarations
+        .iter()
+        .filter_map(|declaration| {
+            let GlobalDeclaration::Struct(structure) = declaration.node() else {
+                return None;
+            };
+            let members = structure
+                .members
+                .iter()
+                .map(|member| {
+                    let mut align = None;
+                    let mut size = None;
+                    for attribute in &member.attributes {
+                        match attribute.node() {
+                            Attribute::Align(expression) => align = const_u32(module, expression),
+                            Attribute::Size(expression) => size = const_u32(module, expression),
+                            _ => {}
+                        }
+                    }
+                    (align, size)
+                })
+                .collect();
+            Some((structure.ident.name().to_string(), members))
+        })
+        .collect()
 }
 
 /// Structs are callable as constructors, but their indexed signature stops at the opening

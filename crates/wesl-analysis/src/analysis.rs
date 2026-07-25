@@ -641,6 +641,42 @@ mod tests {
     }
 
     #[test]
+    fn struct_layout_hints_expose_uniform_padding() {
+        use crate::InlayKind;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("main.wesl");
+        // `radius` before `position` forces 12 bytes of padding — the classic uniform bug.
+        let source = concat!(
+            "struct Sphere {\n",
+            "    radius: f32,\n",
+            "    position: vec3<f32>,\n",
+            "}\n",
+            "@group(0) @binding(0) var<uniform> sphere: Sphere;\n",
+            "fn main() { let r = sphere.radius; }\n",
+        );
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::new(Some(root));
+        host.open(path.clone(), source.into());
+
+        let layout = host
+            .inlay_hints(&path, 0..source.len())
+            .into_iter()
+            .filter(|hint| hint.kind == InlayKind::Layout)
+            .map(|hint| hint.label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            layout,
+            vec![
+                "offset 0, align 4, size 4".to_owned(),
+                "offset 16, align 16, size 12".to_owned(),
+            ],
+            "vec3 must be pushed to offset 16"
+        );
+    }
+
+    #[test]
     fn parameter_hints_are_suppressed_when_the_name_already_matches() {
         use crate::InlayKind;
 

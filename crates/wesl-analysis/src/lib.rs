@@ -4,6 +4,7 @@ mod dialect;
 mod folding;
 mod index;
 mod inlay;
+mod layout;
 mod line_index;
 mod overlay;
 mod root;
@@ -20,6 +21,7 @@ pub use index::{
     WorkspaceSymbol,
 };
 pub use inlay::{InlayHint, InlayKind};
+pub use layout::{MemberLayout, MemberOverrides, align_of, size_of, struct_layout};
 pub use line_index::{LineIndex, Position};
 pub use overlay::OverlayResolver;
 pub use root::discover_root;

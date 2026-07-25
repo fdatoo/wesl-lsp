@@ -764,14 +764,17 @@ fn lsp_inlay_hint(
     hint: AnalysisInlayHint,
 ) -> Option<LspInlayHint> {
     let position = lines.offset_to_position(source, hint.offset)?;
+    // Layout hints are neither a type nor a parameter, so they carry no kind and clients
+    // render them in the neutral inlay style.
     let (kind, pad_left, pad_right) = match hint.kind {
-        InlayKind::Type => (InlayHintKind::TYPE, false, false),
-        InlayKind::Parameter => (InlayHintKind::PARAMETER, false, true),
+        InlayKind::Type => (Some(InlayHintKind::TYPE), false, false),
+        InlayKind::Parameter => (Some(InlayHintKind::PARAMETER), false, true),
+        InlayKind::Layout => (None, true, false),
     };
     Some(LspInlayHint {
         position: LspPosition::new(position.line, position.character),
         label: InlayHintLabel::String(hint.label),
-        kind: Some(kind),
+        kind,
         text_edits: None,
         tooltip: None,
         padding_left: Some(pad_left),

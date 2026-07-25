@@ -152,10 +152,25 @@ folding ranges, selection ranges, hover, completion (trigger character `.`), sig
 (trigger `(`, retrigger `,`), inlay hints, and whole-document formatting. Diagnostics are
 pushed, not pulled.
 
-Inlay hints come from two sources. Type hints reuse the type checker: `inferred_declarations`
-runs the same pass as `analyze_module` but keeps the type it settled on for each declaration
-that had no written annotation, so hints can never disagree with diagnostics. Parameter hints
-are token-based, and are suppressed when the argument already spells the parameter name.
+Inlay hints come from three sources. Type hints reuse the type checker:
+`inferred_declarations` runs the same pass as `analyze_module` but keeps the type it settled
+on for each declaration that had no written annotation, so hints can never disagree with
+diagnostics. Parameter hints are token-based, and are suppressed when the argument already
+spells the parameter name. Layout hints come from `layout.rs`.
+
+### Memory layout (`layout.rs`)
+
+Implements the WGSL specification's alignment and size rules so struct members can be
+annotated with their byte offset, alignment and size. This is the one hint that reports
+something genuinely invisible in the source: `radius: f32` before `position: vec3<f32>` pushes
+the vector to offset 16 and wastes twelve bytes, and a host-side struct that does not match
+fails silently at runtime rather than erroring.
+
+Two things keep it honest. Non-host-shareable types (`bool`, samplers, textures, pointers) and
+runtime-sized arrays return `None` rather than a guess, and the whole struct is then skipped —
+a wrong offset is worse than no offset. And `@align`/`@size` attributes are threaded through
+by struct name, so a nested struct is measured with its own attributes rather than its natural
+layout. The unit tests check the full matrix table from the specification directly.
 
 `folding.rs`, `selection.rs` and `signature.rs` work from tokens and delimiter nesting rather
 than the AST, so all three survive a buffer that does not parse — which is exactly the state
@@ -179,8 +194,6 @@ Deliberately absent, with the reasoning:
 
 Not yet implemented, ordered roughly by value to shader authors:
 
-- **Struct layout inlay hints** — alignment and size per struct member. That information is
-  genuinely hard to get anywhere else and matters for uniform buffer correctness.
 - **Range formatting** — `wesl-fmt::format` is whole-document by construction; range support
   needs a way to bound the AST print, which is not a small change.
 - **Incremental sync** — currently `FULL`. Only worth doing if large shaders show latency.
