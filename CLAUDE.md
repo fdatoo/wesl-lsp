@@ -152,10 +152,15 @@ folding ranges, selection ranges, hover, completion (trigger character `.`), sig
 (trigger `(`, retrigger `,`), inlay hints, whole-document formatting, and `willRenameFiles`
 for `.wesl`/`.wgsl`.
 
-`willRenameFiles` rewrites import paths that pointed at the renamed shader. It resolves each
-candidate through `module_file` before touching any text, so a module of the same name in
-another package is never edited, and the path match requires a segment boundary so
-`package::mesh` does not match inside `package::mesh_utils`.
+`willRenameFiles` rewrites import paths that pointed at the renamed shader, for both file and
+directory renames. It resolves each candidate through `module_file` before touching any text,
+so a module of the same name in another package is never edited, and the path match requires a
+segment boundary so `package::mesh` does not match inside `package::mesh_utils`.
+
+A directory rename moves every shader beneath it, so `file_rename_edits` builds one rewrite
+per moved shader. Note it skips nothing by path: a shader *inside* the renamed directory that
+imports a sibling in that same directory needs rewriting too, which a `path == old_path` guard
+would silently miss.
 
 ### Configuration
 

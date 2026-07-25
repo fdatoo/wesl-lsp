@@ -333,14 +333,26 @@ fn capabilities(pull_diagnostics: bool) -> ServerCapabilities {
             workspace_folders: None,
             file_operations: Some(WorkspaceFileOperationsServerCapabilities {
                 will_rename: Some(FileOperationRegistrationOptions {
-                    filters: vec![FileOperationFilter {
-                        scheme: Some("file".to_owned()),
-                        pattern: FileOperationPattern {
-                            glob: "**/*.{wesl,wgsl}".to_owned(),
-                            matches: Some(FileOperationPatternKind::File),
-                            options: None,
+                    filters: vec![
+                        FileOperationFilter {
+                            scheme: Some("file".to_owned()),
+                            pattern: FileOperationPattern {
+                                glob: "**/*.{wesl,wgsl}".to_owned(),
+                                matches: Some(FileOperationPatternKind::File),
+                                options: None,
+                            },
                         },
-                    }],
+                        // Moving a directory changes the module path of every shader under
+                        // it, so imports into it need the same treatment.
+                        FileOperationFilter {
+                            scheme: Some("file".to_owned()),
+                            pattern: FileOperationPattern {
+                                glob: "**".to_owned(),
+                                matches: Some(FileOperationPatternKind::Folder),
+                                options: None,
+                            },
+                        },
+                    ],
                 }),
                 ..WorkspaceFileOperationsServerCapabilities::default()
             }),

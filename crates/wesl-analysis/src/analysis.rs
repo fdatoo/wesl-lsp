@@ -574,6 +574,60 @@ mod tests {
     }
 
     #[test]
+    fn renaming_a_directory_rewrites_outside_and_sibling_imports() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mesh = root.join("mesh");
+        fs::create_dir(&mesh).unwrap();
+
+        // Two shaders inside the directory, one importing the other.
+        fs::write(mesh.join("common.wesl"), "const scale = 2.0;\n").unwrap();
+        let sibling_source = "import package::mesh::common::scale;\nconst doubled = scale * 2.0;\n";
+        fs::write(mesh.join("surface.wesl"), sibling_source).unwrap();
+
+        // And one outside importing in.
+        let outside = root.join("main.wesl");
+        let outside_source = "import package::mesh::surface::doubled;\nconst total = doubled;\n";
+        fs::write(&outside, outside_source).unwrap();
+
+        let mut host = AnalysisHost::new(Some(root.clone()));
+        host.open(outside.clone(), outside_source.into());
+
+        let edits = host.file_rename_edits(&mesh, &root.join("geometry"));
+
+        // The external importer is rewritten.
+        let external = edits
+            .iter()
+            .find(|edit| edit.path == outside)
+            .unwrap_or_else(|| panic!("{edits:#?}"));
+        assert_eq!(
+            &outside_source[external.range.clone()],
+            "package::mesh::surface"
+        );
+        assert_eq!(external.new_text, "package::geometry::surface");
+
+        // And so is the sibling inside the moved directory — the case a path-based skip
+        // would silently miss.
+        let sibling = edits
+            .iter()
+            .find(|edit| edit.path == mesh.join("surface.wesl"))
+            .unwrap_or_else(|| panic!("sibling import not rewritten: {edits:#?}"));
+        assert_eq!(
+            &sibling_source[sibling.range.clone()],
+            "package::mesh::common"
+        );
+        assert_eq!(sibling.new_text, "package::geometry::common");
+
+        // Renaming a directory nothing imports from produces nothing.
+        let unrelated = root.join("unused");
+        fs::create_dir(&unrelated).unwrap();
+        assert!(
+            host.file_rename_edits(&unrelated, &root.join("other"))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn prepare_rename_agrees_with_rename() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("shader.wesl");

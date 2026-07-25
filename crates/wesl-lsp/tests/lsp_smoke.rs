@@ -1414,3 +1414,68 @@ fn configuration_gates_struct_layout_hints_and_updates_live() {
 
     client.shutdown();
 }
+
+#[test]
+fn renaming_a_directory_returns_import_edits() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mesh = root.join("mesh");
+    fs::create_dir(&mesh).unwrap();
+    fs::write(mesh.join("surface.wesl"), "const doubled = 2.0;\n").unwrap();
+    let path = root.join("main.wesl");
+    let source = "import package::mesh::surface::doubled;\nconst total = doubled;\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    let filters = &initialized["result"]["capabilities"]["workspace"]["fileOperations"]["willRename"]
+        ["filters"];
+    assert!(
+        filters
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|filter| filter["pattern"]["matches"] == "folder"),
+        "folder renames must be registered: {initialized:#?}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    client.receive_diagnostics(&uri);
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "workspace/willRenameFiles",
+        "params": {
+            "files": [{
+                "oldUri": lsp_types::Url::from_file_path(&mesh).unwrap(),
+                "newUri": lsp_types::Url::from_file_path(root.join("geometry")).unwrap()
+            }]
+        }
+    }));
+    let edits = client.receive_response(2);
+    let changes = &edits["result"]["changes"][uri.as_str()];
+    assert_eq!(
+        changes[0]["newText"], "package::geometry::surface",
+        "{edits:#?}"
+    );
+
+    client.shutdown();
+}

@@ -294,50 +294,73 @@ impl PackageIndex {
 
     /// Edits that keep imports pointing at a shader that is about to be renamed. Called
     /// before the rename happens, so the index still describes the old layout.
+    /// Import rewrites for a rename. `old_path` may be a single shader or a directory, in
+    /// which case every shader beneath it moves and each contributes its own rewrite.
     pub(crate) fn file_rename_edits(&self, old_path: &Path, new_path: &Path) -> Vec<SourceEdit> {
-        let (Some(old_module), Some(new_module)) = (
-            module_name(&self.root, old_path),
-            module_name(&self.root, new_path),
-        ) else {
-            return Vec::new();
+        // Shaders whose module path changes, paired with where they land.
+        let moved = if self.files.contains_key(old_path) {
+            vec![(old_path.to_path_buf(), new_path.to_path_buf())]
+        } else {
+            self.files
+                .keys()
+                .filter_map(|path| {
+                    let relative = path.strip_prefix(old_path).ok()?;
+                    Some((path.clone(), new_path.join(relative)))
+                })
+                .collect()
         };
-        if old_module == new_module {
+
+        let rewrites = moved
+            .iter()
+            .filter_map(|(old_file, new_file)| {
+                let old_module = module_name(&self.root, old_file)?;
+                let new_module = module_name(&self.root, new_file)?;
+                (old_module != new_module).then(|| {
+                    (
+                        old_file.clone(),
+                        format!("package::{old_module}"),
+                        format!("package::{new_module}"),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if rewrites.is_empty() {
             return Vec::new();
         }
-        let old_text = format!("package::{old_module}");
-        let new_text = format!("package::{new_module}");
 
         let mut edits = Vec::new();
         for (path, file) in &self.files {
-            if path == old_path {
-                continue;
+            // Nothing is skipped by path: when a directory moves, a shader inside it that
+            // imports a sibling in that same directory still needs rewriting.
+            for (target, old_text, new_text) in &rewrites {
+                // Resolve first: only rewrite text in files that genuinely import this
+                // module, so a same-named module in another package is never touched.
+                let imports_target = file
+                    .imports
+                    .iter()
+                    .map(|binding| &binding.module)
+                    .chain(file.imported_modules.iter())
+                    .any(|module| self.module_file(module).as_deref() == Some(target.as_path()));
+                if !imports_target {
+                    continue;
+                }
+                edits.extend(
+                    import_path_ranges(&file.source, old_text)
+                        .into_iter()
+                        .map(|range| SourceEdit {
+                            path: path.clone(),
+                            range,
+                            new_text: new_text.clone(),
+                        }),
+                );
             }
-            // Resolve first: only rewrite text in files that genuinely import this module,
-            // so a same-named module in another package is never touched.
-            let imports_target = file
-                .imports
-                .iter()
-                .map(|binding| &binding.module)
-                .chain(file.imported_modules.iter())
-                .any(|module| self.module_file(module).as_deref() == Some(old_path));
-            if !imports_target {
-                continue;
-            }
-            edits.extend(
-                import_path_ranges(&file.source, &old_text)
-                    .into_iter()
-                    .map(|range| SourceEdit {
-                        path: path.clone(),
-                        range,
-                        new_text: new_text.clone(),
-                    }),
-            );
         }
         edits.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
                 .then(left.range.start.cmp(&right.range.start))
         });
+        edits.dedup();
         edits
     }
 
