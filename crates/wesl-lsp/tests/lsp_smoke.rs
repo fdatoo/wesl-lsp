@@ -676,3 +676,72 @@ fn highlights_and_prepares_rename() {
 
     client.shutdown();
 }
+
+#[test]
+fn workspace_symbols_reach_unopened_files() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    // Only main.wesl is opened; types.wesl must still be searchable.
+    fs::write(
+        root.join("types.wesl"),
+        "struct Camera { projection: mat4x4<f32>, }\n",
+    )
+    .unwrap();
+    let path = root.join("main.wesl");
+    let source = "fn project() -> f32 { return 1.0; }\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["workspaceSymbolProvider"],
+        json!(true)
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    client.receive_diagnostics(&uri);
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "workspace/symbol",
+        "params": {"query": "proj"}
+    }));
+    let symbols = client.receive_response(2);
+    let found = symbols["result"].as_array().unwrap();
+    let projection = found
+        .iter()
+        .find(|symbol| symbol["name"] == "projection")
+        .unwrap_or_else(|| panic!("{symbols:#?}"));
+    assert_eq!(projection["containerName"], "Camera");
+    assert!(
+        projection["location"]["uri"]
+            .as_str()
+            .unwrap()
+            .ends_with("types.wesl"),
+        "{projection:#?}"
+    );
+    assert!(
+        found.iter().any(|symbol| symbol["name"] == "project"),
+        "{symbols:#?}"
+    );
+
+    client.shutdown();
+}

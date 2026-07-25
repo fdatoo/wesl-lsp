@@ -44,6 +44,14 @@ pub struct Symbol {
     pub children: Vec<Symbol>,
 }
 
+/// A [`Symbol`] flattened out of its file, for `workspace/symbol`. Struct members keep
+/// the name of the struct they came from so the editor can disambiguate same-named fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceSymbol {
+    pub symbol: Symbol,
+    pub container: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
     pub path: PathBuf,
@@ -280,6 +288,36 @@ impl PackageIndex {
             .get(path)
             .map(|file| file.symbols.clone())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn workspace_symbols(&self, query: &str) -> Vec<WorkspaceSymbol> {
+        let query = query.to_lowercase();
+        let mut matches = Vec::new();
+        for file in self.files.values() {
+            for symbol in &file.symbols {
+                if name_matches(&symbol.name, &query) {
+                    matches.push(WorkspaceSymbol {
+                        symbol: symbol.clone(),
+                        container: None,
+                    });
+                }
+                for child in &symbol.children {
+                    if name_matches(&child.name, &query) {
+                        matches.push(WorkspaceSymbol {
+                            symbol: child.clone(),
+                            container: Some(symbol.name.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+        matches.sort_by(|left, right| {
+            left.symbol
+                .path
+                .cmp(&right.symbol.path)
+                .then(left.symbol.range.start.cmp(&right.symbol.range.start))
+        });
+        matches
     }
 
     pub(crate) fn hover(&self, path: &Path, offset: usize) -> Option<HoverInfo> {
@@ -1352,6 +1390,12 @@ fn is_identifier(name: &str) -> bool {
         .next()
         .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Case-insensitive substring match. An empty query matches everything, which is what
+/// clients that populate the symbol picker before the user types expect.
+fn name_matches(name: &str, lowercase_query: &str) -> bool {
+    lowercase_query.is_empty() || name.to_lowercase().contains(lowercase_query)
 }
 
 fn is_builtin(name: &str) -> bool {

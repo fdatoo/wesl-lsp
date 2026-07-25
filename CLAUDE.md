@@ -147,8 +147,13 @@ legitimate reason to refuse.
 ## Capability surface
 
 `capabilities()` in `crates/wesl-lsp/src/main.rs` advertises: full-document sync, definition,
-references, rename (with prepare), document symbols, document highlight, hover, completion
-(trigger character `.`), and whole-document formatting. Diagnostics are pushed, not pulled.
+references, rename (with prepare), document symbols, document highlight, workspace symbols,
+hover, completion (trigger character `.`), and whole-document formatting. Diagnostics are
+pushed, not pulled.
+
+`workspace/symbol` searches the packages owning currently open documents, indexing each open
+buffer's root on demand. Files that were never opened are still found, because `PackageIndex`
+walks the whole root — but a root nobody has opened is not searched.
 
 Deliberately absent, with the reasoning:
 
@@ -170,7 +175,7 @@ Not yet implemented, ordered roughly by value to shader authors:
   needs a way to bound the AST print, which is not a small change.
 - **Incremental sync** — currently `FULL`. Only worth doing if large shaders show latency.
 - **`willRename` file operations** — rewriting import paths when a shader file is renamed.
-- **Semantic tokens, code actions, workspace symbols** — no work started.
+- **Semantic tokens and code actions** — no work started.
 
 Adding a capability means touching four layers in order: `capabilities()`, a `METHOD` arm in
 `handle_request`, an offset-based method on `AnalysisHost`, and a case in `lsp_smoke.rs` — which

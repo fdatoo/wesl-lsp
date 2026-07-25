@@ -8,8 +8,8 @@ use std::{
 use wgsl_parse::{parse_str, syntax::TranslationUnit};
 
 use crate::{
-    Completion, HoverInfo, Location, OverlayResolver, PackageIndex, SourceEdit, Symbol, dialect,
-    discover_root,
+    Completion, HoverInfo, Location, OverlayResolver, PackageIndex, SourceEdit, Symbol,
+    WorkspaceSymbol, dialect, discover_root,
 };
 use wesl::Resolver;
 
@@ -260,6 +260,28 @@ impl AnalysisHost {
         self.ensure_package(path).rename(path, offset, new_name)
     }
 
+    /// Searches the packages owning the currently open documents. Packages are built
+    /// lazily, so this indexes the root of every open buffer first — the alternative
+    /// would be scanning every root on disk, which the editor has not asked for.
+    pub fn workspace_symbols(&mut self, query: &str) -> Vec<WorkspaceSymbol> {
+        for path in self.documents.keys().cloned().collect::<Vec<_>>() {
+            self.ensure_package(&path);
+        }
+        let mut symbols = self
+            .packages
+            .values()
+            .flat_map(|package| package.workspace_symbols(query))
+            .collect::<Vec<_>>();
+        symbols.sort_by(|left, right| {
+            left.symbol
+                .path
+                .cmp(&right.symbol.path)
+                .then(left.symbol.range.start.cmp(&right.symbol.range.start))
+        });
+        symbols.dedup();
+        symbols
+    }
+
     pub fn document_highlights(&mut self, path: &Path, offset: usize) -> Vec<Range<usize>> {
         self.ensure_package(path).document_highlights(path, offset)
     }
@@ -496,6 +518,39 @@ mod tests {
             host.prepare_rename(&path, literal),
             Err("no symbol to rename here")
         );
+    }
+
+    #[test]
+    fn workspace_symbols_span_files_and_include_struct_members() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let types_path = root.join("types.wesl");
+        fs::write(&types_path, "struct Camera { projection: mat4x4<f32>, }\n").unwrap();
+        let main_path = root.join("main.wesl");
+        let main_source = "fn project() -> f32 { return 1.0; }\n";
+        fs::write(&main_path, main_source).unwrap();
+
+        let mut host = AnalysisHost::new(Some(root));
+        host.open(main_path.clone(), main_source.into());
+
+        // Matching is case-insensitive and substring-based, so "proj" spans both files.
+        let found = host.workspace_symbols("proj");
+        let names = found
+            .iter()
+            .map(|found| found.symbol.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"projection"), "{names:?}");
+        assert!(names.contains(&"project"), "{names:?}");
+
+        let member = found
+            .iter()
+            .find(|found| found.symbol.name == "projection")
+            .unwrap();
+        assert_eq!(member.container.as_deref(), Some("Camera"));
+        assert_eq!(member.symbol.path, types_path);
+
+        assert!(host.workspace_symbols("nothing_matches_this").is_empty());
+        assert!(host.workspace_symbols("").len() >= 3);
     }
 
     #[test]

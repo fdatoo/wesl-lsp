@@ -18,9 +18,10 @@ use lsp_types::{
     HoverProviderCapability, InitializeParams, InitializeResult, InsertTextFormat,
     Location as LspLocation, MarkupContent, MarkupKind, OneOf, Position as LspPosition,
     PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
-    RenameOptions, RenameParams, ServerCapabilities, SymbolKind as LspSymbolKind,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
-    WorkDoneProgressOptions, WorkspaceEdit,
+    RenameOptions, RenameParams, ServerCapabilities, SymbolInformation,
+    SymbolKind as LspSymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
     notification::{
         DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
         Notification as NotificationTrait, PublishDiagnostics,
@@ -28,13 +29,13 @@ use lsp_types::{
     request::{
         Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
         HoverRequest, PrepareRenameRequest, References, Rename, Request as RequestTrait,
-        WorkspaceConfiguration,
+        WorkspaceConfiguration, WorkspaceSymbolRequest,
     },
 };
 use serde::Deserialize;
 use wesl_analysis::{
     AnalysisHost, Completion as AnalysisCompletion, CompletionKind, DiagnosticSeverity, LineIndex,
-    Symbol, SymbolKind,
+    Symbol, SymbolKind, WorkspaceSymbol as AnalysisWorkspaceSymbol,
 };
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -170,6 +171,7 @@ fn capabilities() -> ServerCapabilities {
         })),
         document_symbol_provider: Some(OneOf::Left(true)),
         document_highlight_provider: Some(OneOf::Left(true)),
+        workspace_symbol_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".to_owned()]),
@@ -408,6 +410,16 @@ impl Server<'_> {
                         message.to_owned(),
                     ),
                 }
+            }
+            WorkspaceSymbolRequest::METHOD => {
+                let params: WorkspaceSymbolParams = serde_json::from_value(request.params)?;
+                let symbols = self
+                    .analysis
+                    .workspace_symbols(&params.query)
+                    .into_iter()
+                    .filter_map(workspace_symbol_information)
+                    .collect();
+                Response::new_ok(request.id, WorkspaceSymbolResponse::Flat(symbols))
             }
             DocumentHighlightRequest::METHOD => {
                 let params: DocumentHighlightParams = serde_json::from_value(request.params)?;
@@ -669,6 +681,36 @@ fn lsp_location(location: wesl_analysis::Location) -> Option<LspLocation> {
     ))
 }
 
+/// `SymbolInformation` is deprecated in favour of the 3.17 nested `WorkspaceSymbol`, but it
+/// is what every client understands, so the flat shape is the compatible choice here.
+#[allow(deprecated)]
+fn workspace_symbol_information(found: AnalysisWorkspaceSymbol) -> Option<SymbolInformation> {
+    let symbol = found.symbol;
+    Some(SymbolInformation {
+        name: symbol.name.to_string(),
+        kind: lsp_symbol_kind(symbol.kind),
+        tags: None,
+        deprecated: None,
+        location: LspLocation::new(
+            Url::from_file_path(&symbol.path).ok()?,
+            lsp_range_for_file(&symbol.path, symbol.range)?,
+        ),
+        container_name: found.container,
+    })
+}
+
+fn lsp_symbol_kind(kind: SymbolKind) -> LspSymbolKind {
+    match kind {
+        SymbolKind::Function => LspSymbolKind::FUNCTION,
+        SymbolKind::Struct => LspSymbolKind::STRUCT,
+        SymbolKind::Field => LspSymbolKind::FIELD,
+        SymbolKind::Variable => LspSymbolKind::VARIABLE,
+        SymbolKind::Constant => LspSymbolKind::CONSTANT,
+        SymbolKind::Override => LspSymbolKind::VARIABLE,
+        SymbolKind::Alias => LspSymbolKind::TYPE_PARAMETER,
+    }
+}
+
 #[allow(deprecated)]
 fn document_symbol(path: &Path, symbol: Symbol) -> Option<DocumentSymbol> {
     let range = lsp_range_for_file(path, symbol.full_range)?;
@@ -681,15 +723,7 @@ fn document_symbol(path: &Path, symbol: Symbol) -> Option<DocumentSymbol> {
     Some(DocumentSymbol {
         name: symbol.name.to_string(),
         detail: Some(symbol.signature),
-        kind: match symbol.kind {
-            SymbolKind::Function => LspSymbolKind::FUNCTION,
-            SymbolKind::Struct => LspSymbolKind::STRUCT,
-            SymbolKind::Field => LspSymbolKind::FIELD,
-            SymbolKind::Variable => LspSymbolKind::VARIABLE,
-            SymbolKind::Constant => LspSymbolKind::CONSTANT,
-            SymbolKind::Override => LspSymbolKind::VARIABLE,
-            SymbolKind::Alias => LspSymbolKind::TYPE_PARAMETER,
-        },
+        kind: lsp_symbol_kind(symbol.kind),
         tags: None,
         deprecated: None,
         range,
