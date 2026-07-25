@@ -12,30 +12,31 @@ use lsp_types::{
     ConfigurationItem, ConfigurationParams, Diagnostic as LspDiagnostic, DiagnosticOptions,
     DiagnosticRelatedInformation, DiagnosticServerCapabilities,
     DiagnosticSeverity as LspDiagnosticSeverity, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportKind,
-    DocumentDiagnosticReportResult, DocumentFormattingParams, DocumentHighlight,
-    DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, Documentation, FileOperationFilter, FileOperationPattern,
-    FileOperationPatternKind, FileOperationRegistrationOptions, FoldingRange as LspFoldingRange,
-    FoldingRangeKind, FoldingRangeParams, FoldingRangeProviderCapability,
-    FullDocumentDiagnosticReport, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InlayHint as LspInlayHint, InlayHintKind, InlayHintLabel, InlayHintOptions, InlayHintParams,
-    InlayHintServerCapabilities, InsertTextFormat, Location as LspLocation, MarkupContent,
-    MarkupKind, OneOf, ParameterInformation, ParameterLabel, Position as LspPosition,
-    PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
-    RelatedFullDocumentDiagnosticReport, RenameFilesParams, RenameOptions, RenameParams,
-    SaveOptions, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
-    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
-    SignatureInformation, SymbolInformation, SymbolKind as LspSymbolKind,
+    DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
+    DocumentDiagnosticReportKind, DocumentDiagnosticReportResult, DocumentFormattingParams,
+    DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol,
+    DocumentSymbolParams, DocumentSymbolResponse, Documentation, FileOperationFilter,
+    FileOperationPattern, FileOperationPatternKind, FileOperationRegistrationOptions,
+    FoldingRange as LspFoldingRange, FoldingRangeKind, FoldingRangeParams,
+    FoldingRangeProviderCapability, FullDocumentDiagnosticReport, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InlayHint as LspInlayHint, InlayHintKind, InlayHintLabel,
+    InlayHintOptions, InlayHintParams, InlayHintServerCapabilities, InsertTextFormat,
+    Location as LspLocation, MarkupContent, MarkupKind, OneOf, ParameterInformation,
+    ParameterLabel, Position as LspPosition, PrepareRenameResponse, PublishDiagnosticsParams,
+    Range as LspRange, ReferenceParams, RelatedFullDocumentDiagnosticReport, RenameFilesParams,
+    RenameOptions, RenameParams, SaveOptions, SelectionRange, SelectionRangeParams,
+    SelectionRangeProviderCapability, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
+    SignatureHelpParams, SignatureInformation, SymbolInformation, SymbolKind as LspSymbolKind,
     TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
     TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkDoneProgressOptions,
-    WorkspaceEdit, WorkspaceFileOperationsServerCapabilities, WorkspaceServerCapabilities,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    WorkspaceEdit, WorkspaceFileOperationsServerCapabilities, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities, WorkspaceSymbolParams, WorkspaceSymbolResponse,
     notification::{
-        DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
-        DidSaveTextDocument, Notification as NotificationTrait, PublishDiagnostics,
+        DidChangeConfiguration, DidChangeTextDocument, DidChangeWorkspaceFolders,
+        DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+        Notification as NotificationTrait, PublishDiagnostics,
     },
     request::{
         Completion, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
@@ -169,9 +170,24 @@ fn main() -> Result<()> {
         startup_messages = queued;
     }
 
+    let workspace_folders = initialize_params
+        .workspace_folders
+        .as_ref()
+        .map(|folders| {
+            folders
+                .iter()
+                .filter_map(|folder| folder.uri.to_file_path().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let initial_roots = match &configuration.root {
+        Some(root) => vec![root.clone()],
+        None => workspace_folders.clone(),
+    };
+
     let mut server = Server {
         connection: &connection,
-        analysis: AnalysisHost::new(configuration.root.clone()),
+        analysis: AnalysisHost::new(initial_roots),
         versions: HashMap::new(),
         pending: HashMap::new(),
         startup_messages,
@@ -180,6 +196,7 @@ fn main() -> Result<()> {
         configuration,
         configuration_scope,
         supports_configuration,
+        workspace_folders,
         pending_configuration: None,
     };
     server.run()?;
@@ -330,7 +347,10 @@ fn capabilities(pull_diagnostics: bool) -> ServerCapabilities {
         }),
         document_formatting_provider: Some(OneOf::Left(true)),
         workspace: Some(WorkspaceServerCapabilities {
-            workspace_folders: None,
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: Some(OneOf::Left(true)),
+            }),
             file_operations: Some(WorkspaceFileOperationsServerCapabilities {
                 will_rename: Some(FileOperationRegistrationOptions {
                     filters: vec![
@@ -373,6 +393,8 @@ struct Server<'a> {
     configuration: Configuration,
     configuration_scope: Option<Url>,
     supports_configuration: bool,
+    /// Roots reported by the client, used only when no explicit root is configured.
+    workspace_folders: Vec<PathBuf>,
     /// Set while a runtime settings refresh is in flight, so its response is recognised in
     /// the main loop rather than blocking for it.
     pending_configuration: Option<RequestId>,
@@ -446,13 +468,21 @@ impl Server<'_> {
         Ok(())
     }
 
+    /// An explicit `root` setting overrides everything; otherwise the client's workspace
+    /// folders are the roots, and with neither we fall back to per-file discovery.
+    fn roots(&self) -> Vec<PathBuf> {
+        match &self.configuration.root {
+            Some(root) => vec![root.clone()],
+            None => self.workspace_folders.clone(),
+        }
+    }
+
     fn apply_configuration(&mut self, configuration: Configuration) -> Result<()> {
         let root_changed = configuration.root != self.configuration.root;
         self.configuration = configuration;
         if root_changed {
             // Discards every cached package, so the next request reindexes under the new root.
-            self.analysis
-                .set_root_override(self.configuration.root.clone());
+            self.analysis.set_roots(self.roots());
         }
         // Diagnostics may have been switched on or off, and a new root changes what resolves.
         for path in self.versions.keys().cloned().collect::<Vec<_>>() {
@@ -465,6 +495,29 @@ impl Server<'_> {
         log::debug!("notification {}", notification.method);
         match notification.method.as_str() {
             DidChangeConfiguration::METHOD => self.request_configuration()?,
+            DidChangeWorkspaceFolders::METHOD => {
+                let params: DidChangeWorkspaceFoldersParams =
+                    serde_json::from_value(notification.params)?;
+                let removed = params
+                    .event
+                    .removed
+                    .iter()
+                    .filter_map(|folder| folder.uri.to_file_path().ok())
+                    .collect::<Vec<_>>();
+                self.workspace_folders
+                    .retain(|folder| !removed.contains(folder));
+                self.workspace_folders.extend(
+                    params
+                        .event
+                        .added
+                        .iter()
+                        .filter_map(|folder| folder.uri.to_file_path().ok()),
+                );
+                self.analysis.set_roots(self.roots());
+                for path in self.versions.keys().cloned().collect::<Vec<_>>() {
+                    self.publish(&path)?;
+                }
+            }
             DidOpenTextDocument::METHOD => {
                 let params: DidOpenTextDocumentParams =
                     serde_json::from_value(notification.params)?;

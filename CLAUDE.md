@@ -109,8 +109,16 @@ never `FileResolver` directly.
 ### Root discovery (`root.rs`)
 
 A `wesl.toml` marker wins outright. Otherwise walk upward through *contiguous* directories that
-contain shaders and stop at the first that doesn't. An explicit root from
-`initializationOptions.root` or `workspace/configuration` overrides both.
+contain shaders and stop at the first that doesn't.
+
+`AnalysisHost` holds a list of roots, and `root_for` treats the two cases differently on
+purpose. A **single** root is authoritative — that is what an explicit root override means, and
+it applies even to a path that does not sit under it, which is what keeps unit tests passing
+that hand it a non-canonical temp path. With **several** roots there is nothing to override, so
+the innermost containing root wins and a path outside all of them falls back to discovery.
+
+An explicit `root` setting overrides everything; otherwise the client's `workspaceFolders` are
+the roots.
 
 ### PackageIndex (`index.rs`)
 

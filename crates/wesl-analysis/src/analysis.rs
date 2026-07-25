@@ -63,22 +63,24 @@ impl Document {
 
 #[derive(Clone, Default)]
 pub struct AnalysisHost {
-    root_override: Option<PathBuf>,
+    roots: Vec<PathBuf>,
     documents: HashMap<PathBuf, Document>,
     packages: HashMap<PathBuf, PackageIndex>,
 }
 
 impl AnalysisHost {
-    pub fn new(root_override: Option<PathBuf>) -> Self {
+    /// Accepts anything iterable, so a single `Option<PathBuf>` root and a multi-root
+    /// `Vec<PathBuf>` both work.
+    pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> Self {
         Self {
-            root_override: root_override.map(|root| root.canonicalize().unwrap_or(root)),
+            roots: canonical_roots(roots),
             documents: HashMap::new(),
             packages: HashMap::new(),
         }
     }
 
-    pub fn set_root_override(&mut self, root: Option<PathBuf>) {
-        self.root_override = root.map(|root| root.canonicalize().unwrap_or(root));
+    pub fn set_roots(&mut self, roots: impl IntoIterator<Item = PathBuf>) {
+        self.roots = canonical_roots(roots);
         self.packages.clear();
     }
 
@@ -109,8 +111,21 @@ impl AnalysisHost {
             .map(|document| document.source.as_ref())
     }
 
+    /// A single configured root is authoritative — that is what an explicit root override
+    /// means, and it holds even for a path that does not sit under it. With several roots
+    /// there is nothing to override, so the innermost containing root wins and anything
+    /// outside all of them falls back to discovery.
     pub fn root_for(&self, path: &Path) -> PathBuf {
-        discover_root(path, self.root_override.as_deref())
+        match self.roots.as_slice() {
+            [] => discover_root(path, None),
+            [only] => discover_root(path, Some(only)),
+            roots => roots
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .cloned()
+                .unwrap_or_else(|| discover_root(path, None)),
+        }
     }
 
     pub fn has_last_good_ast(&self, path: &Path) -> bool {
@@ -365,6 +380,16 @@ impl AnalysisHost {
             }
         }
     }
+}
+
+fn canonical_roots(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut roots = roots
+        .into_iter()
+        .map(|root| root.canonicalize().unwrap_or(root))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 fn wesl_error_span(error: &wesl::Error) -> Option<Range<usize>> {
@@ -625,6 +650,55 @@ mod tests {
             host.file_rename_edits(&unrelated, &root.join("other"))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn each_workspace_folder_resolves_against_its_own_root() {
+        let temp = tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let first = base.join("first");
+        let second = base.join("second");
+        fs::create_dir_all(first.join("nested")).unwrap();
+        fs::create_dir(&second).unwrap();
+
+        // Same module name in both roots, resolving to different files.
+        fs::write(first.join("shared.wesl"), "const value: f32 = 1.0;\n").unwrap();
+        fs::write(second.join("shared.wesl"), "const value: f32 = 2.0;\n").unwrap();
+
+        let first_main = first.join("main.wesl");
+        let first_source = "import package::shared::value;\nconst total: f32 = value;\n";
+        fs::write(&first_main, first_source).unwrap();
+        let second_main = second.join("main.wesl");
+        let second_source = "import package::shared::value;\nconst total: f32 = value;\n";
+        fs::write(&second_main, second_source).unwrap();
+
+        let mut host = AnalysisHost::new(vec![first.clone(), second.clone()]);
+        assert_eq!(host.root_for(&first_main), first);
+        assert_eq!(host.root_for(&second_main), second);
+
+        // Both resolve cleanly, each against its own package.
+        host.open(first_main.clone(), first_source.into());
+        host.open(second_main.clone(), second_source.into());
+        assert!(host.diagnostics(&first_main).is_empty());
+        assert!(host.diagnostics(&second_main).is_empty());
+
+        // The innermost containing root wins when roots nest.
+        let mut nested = AnalysisHost::new(vec![base.clone(), first.clone()]);
+        assert_eq!(nested.root_for(&first_main), first);
+        assert_eq!(nested.root_for(&second_main), base);
+
+        // A path outside every root falls back to discovery rather than an arbitrary root.
+        let outside = base.join("loose.wesl");
+        fs::write(&outside, "const value = 1;\n").unwrap();
+        let elsewhere = AnalysisHost::new(vec![first.clone(), second.clone()]);
+        assert_eq!(
+            elsewhere.root_for(&outside),
+            crate::discover_root(&outside, None)
+        );
+
+        // Dropping a folder reindexes: only the surviving root is used.
+        nested.set_roots(vec![base.clone()]);
+        assert_eq!(nested.root_for(&first_main), base);
     }
 
     #[test]
