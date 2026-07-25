@@ -1937,3 +1937,129 @@ fn advertising_pull_support_alone_does_not_disable_push() {
 
     client.shutdown();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Real client capability fixtures.
+//
+// Captured verbatim from each client's source on 2026-07-25. The Zed pull-diagnostics
+// regression happened because these were assumed rather than checked, so they are frozen here
+// and the behaviour each one produces is asserted. If a client changes what it sends, refresh
+// the fixture deliberately and look at what the assertions do.
+// ---------------------------------------------------------------------------------------------
+
+/// zed-industries/zed, crates/lsp/src/lsp.rs `default_initialize_params`.
+/// `textDocument.diagnostic` is present because `lsp_pull_diagnostics.enabled` defaults to true.
+fn zed_capabilities() -> Value {
+    json!({
+        "general": {"positionEncodings": ["utf-16"]},
+        "workspace": {
+            "configuration": true,
+            "didChangeConfiguration": {"dynamicRegistration": true},
+            "workspaceFolders": true,
+            "diagnostics": {"refreshSupport": true}
+        },
+        "textDocument": {
+            "diagnostic": {"dynamicRegistration": true, "relatedDocumentSupport": true},
+            "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
+            "foldingRange": {"lineFoldingOnly": false}
+        }
+    })
+}
+
+/// neovim/neovim, runtime/lua/vim/lsp/protocol.lua `make_client_capabilities`.
+fn neovim_capabilities() -> Value {
+    json!({
+        "general": {"positionEncodings": ["utf-8", "utf-16", "utf-32"]},
+        "workspace": {"configuration": true, "workspaceFolders": true},
+        "textDocument": {"documentSymbol": {"hierarchicalDocumentSymbolSupport": true}}
+    })
+}
+
+/// Brings a server up with the given capabilities, answering the startup settings request that
+/// any client advertising `workspace.configuration` triggers.
+fn initialize_with(capabilities: Value, root: &std::path::Path) -> (Client, Value) {
+    let mut client = Client::start();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": capabilities,
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    let request = client.receive();
+    assert_eq!(
+        request["method"], "workspace/configuration",
+        "both fixtures advertise workspace.configuration: {request:#?}"
+    );
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": request["id"].clone(),
+        "result": [{"root": root}]
+    }));
+    (client, initialized)
+}
+
+#[test]
+fn zed_gets_push_diagnostics_and_utf16() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = "fn main() { let x: bool = 1.0; }\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+
+    let (mut client, initialized) = initialize_with(zed_capabilities(), &root);
+    let capabilities = &initialized["result"]["capabilities"];
+
+    assert_eq!(capabilities["positionEncoding"], "utf-16");
+    assert!(
+        capabilities.get("diagnosticProvider").is_none(),
+        "Zed advertises pull but it was backed out for Zed; push must survive: {initialized:#?}"
+    );
+    assert_eq!(
+        capabilities["workspace"]["workspaceFolders"]["supported"],
+        true
+    );
+
+    // And diagnostics must actually arrive without being asked for.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    let published = client.receive_diagnostics(&uri);
+    assert_eq!(
+        published["params"]["diagnostics"][0]["message"],
+        "type mismatch: expected bool, found f32"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn neovim_gets_utf8_columns() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    fs::write(root.join("main.wesl"), "const value = 1;\n").unwrap();
+
+    let (mut client, initialized) = initialize_with(neovim_capabilities(), &root);
+    assert_eq!(
+        initialized["result"]["capabilities"]["positionEncoding"], "utf-8",
+        "Neovim offers utf-8 first and analysis is byte-native: {initialized:#?}"
+    );
+    // Neovim does not advertise pull diagnostics at all, so push is the only option.
+    assert!(
+        initialized["result"]["capabilities"]
+            .get("diagnosticProvider")
+            .is_none()
+    );
+
+    client.shutdown();
+}

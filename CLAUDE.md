@@ -320,7 +320,12 @@ language server that lights up correct code.
 - `span_fidelity.rs` asserts every span the parser reports slices to the exact expected source
   text. Span drift is what turns a correct diagnostic into a squiggle under the wrong token.
 - `lsp_smoke.rs` spawns the real binary and speaks JSON-RPC over stdio — the only test that
-  covers protocol wiring.
+  covers protocol wiring. It also carries **frozen capability fixtures** for Zed and Neovim,
+  captured verbatim from their sources, asserting what each one negotiates. Those exist because
+  assuming client capabilities caused a real regression: Zed advertises pull diagnostics by
+  default, and honouring that silently moved every Zed user onto a path that had already been
+  backed out. If a client changes what it sends, refresh the fixture deliberately and read what
+  the assertions do.
 - `editor_services_corpus.rs` runs every offset-based service — hover, completion, definition,
   signature help, highlights, prepare-rename, selection, folding, inlay hints — over the corpus,
   asserting no panics and no structurally invalid results. The other corpus tests only touch
