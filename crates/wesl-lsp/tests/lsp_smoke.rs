@@ -1556,3 +1556,83 @@ fn clients_without_utf8_keep_utf16() {
     client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
     client.shutdown();
 }
+
+#[test]
+fn range_formatting_touches_only_the_requested_range() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    // Both functions are over-indented; only the second is inside the requested range.
+    let source = concat!(
+        "fn first() {\n",
+        "      let x = 1;\n",
+        "}\n",
+        "fn second() {\n",
+        "      let y = 2;\n",
+        "}\n",
+    );
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["documentRangeFormattingProvider"],
+        json!(true)
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    client.receive_diagnostics(&uri);
+
+    let second_body = source.find("      let y").unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/rangeFormatting",
+        "params": {
+            "textDocument": {"uri": uri},
+            "range": {
+                "start": position(source, second_body),
+                "end": position(source, second_body + "      let y = 2;".len())
+            },
+            "options": {"tabSize": 4, "insertSpaces": true}
+        }
+    }));
+    let response = client.receive_response(2);
+    let edits = response["result"].as_array().unwrap();
+    assert!(!edits.is_empty(), "{response:#?}");
+
+    // Every returned edit must sit on the requested line, leaving `first` alone.
+    let requested_line = position(source, second_body)["line"].as_u64().unwrap();
+    for edit in edits {
+        assert_eq!(
+            edit["range"]["start"]["line"].as_u64().unwrap(),
+            requested_line,
+            "edit outside the requested range: {response:#?}"
+        );
+    }
+    assert!(
+        edits
+            .iter()
+            .any(|edit| edit["newText"].as_str().unwrap().contains("    let y = 2;")),
+        "{response:#?}"
+    );
+
+    client.shutdown();
+}

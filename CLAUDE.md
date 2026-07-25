@@ -158,13 +158,21 @@ long argument lists), then reattaches comments by aligning token streams between
 the printed output — the AST does not carry comments. `attach_comments` failing to align is a
 legitimate reason to refuse.
 
+**Range formatting does not weaken any of that.** It formats the whole document through the
+same gate and then uses `diff::line_hunks` to return only the hunks touching the requested
+range. The diff trims a common head and tail, then aligns the changed middle by
+longest-common-subsequence so two distant edits stay two hunks — collapsing them into one
+would hand back an edit covering more than the client asked for. Beyond
+`MAX_ALIGNED_LINES` on either side it degrades to a single hunk rather than allocating a
+quadratic table.
+
 ## Capability surface
 
 `capabilities()` in `crates/wesl-lsp/src/main.rs` advertises: incremental sync, definition,
 references, rename (with prepare), document symbols, document highlight, workspace symbols,
 folding ranges, selection ranges, hover, completion (trigger character `.`), signature help
-(trigger `(`, retrigger `,`), inlay hints, whole-document formatting, and `willRenameFiles`
-for `.wesl`/`.wgsl`.
+(trigger `(`, retrigger `,`), inlay hints, whole-document and range formatting, and
+`willRenameFiles` for `.wesl`/`.wgsl` files and folders.
 
 `willRenameFiles` rewrites import paths that pointed at the renamed shader, for both file and
 directory renames. It resolves each candidate through `module_file` before touching any text,
@@ -256,8 +264,6 @@ Deliberately absent, with the reasoning:
 
 Not yet implemented, ordered roughly by value to shader authors:
 
-- **Range formatting** — `wesl-fmt::format` is whole-document by construction; range support
-  needs a way to bound the AST print, which is not a small change.
 - **Semantic tokens and code actions** — no work started.
 
 Adding a capability means touching four layers in order: `capabilities()`, a `METHOD` arm in

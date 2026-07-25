@@ -1,4 +1,8 @@
+pub mod diff;
+
 use std::{collections::BTreeMap, path::Path};
+
+pub use diff::{Hunk, line_hunks};
 
 use wgsl_parse::syntax::TranslationUnit;
 

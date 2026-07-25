@@ -15,17 +15,17 @@ use lsp_types::{
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportKind, DocumentDiagnosticReportResult, DocumentFormattingParams,
-    DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol,
-    DocumentSymbolParams, DocumentSymbolResponse, Documentation, FileOperationFilter,
-    FileOperationPattern, FileOperationPatternKind, FileOperationRegistrationOptions,
-    FoldingRange as LspFoldingRange, FoldingRangeKind, FoldingRangeParams,
-    FoldingRangeProviderCapability, FullDocumentDiagnosticReport, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InlayHint as LspInlayHint, InlayHintKind, InlayHintLabel,
-    InlayHintOptions, InlayHintParams, InlayHintServerCapabilities, InsertTextFormat,
-    Location as LspLocation, MarkupContent, MarkupKind, OneOf, ParameterInformation,
-    ParameterLabel, Position as LspPosition, PositionEncodingKind, PrepareRenameResponse,
-    PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
+    DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
+    DocumentRangeFormattingParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
+    Documentation, FileOperationFilter, FileOperationPattern, FileOperationPatternKind,
+    FileOperationRegistrationOptions, FoldingRange as LspFoldingRange, FoldingRangeKind,
+    FoldingRangeParams, FoldingRangeProviderCapability, FullDocumentDiagnosticReport,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InlayHint as LspInlayHint,
+    InlayHintKind, InlayHintLabel, InlayHintOptions, InlayHintParams, InlayHintServerCapabilities,
+    InsertTextFormat, Location as LspLocation, MarkupContent, MarkupKind, OneOf,
+    ParameterInformation, ParameterLabel, Position as LspPosition, PositionEncodingKind,
+    PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
     RelatedFullDocumentDiagnosticReport, RenameFilesParams, RenameOptions, RenameParams,
     SaveOptions, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
     ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
@@ -42,8 +42,9 @@ use lsp_types::{
     request::{
         Completion, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
         FoldingRangeRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
-        PrepareRenameRequest, References, Rename, Request as RequestTrait, SelectionRangeRequest,
-        SignatureHelpRequest, WillRenameFiles, WorkspaceConfiguration, WorkspaceSymbolRequest,
+        PrepareRenameRequest, RangeFormatting, References, Rename, Request as RequestTrait,
+        SelectionRangeRequest, SignatureHelpRequest, WillRenameFiles, WorkspaceConfiguration,
+        WorkspaceSymbolRequest,
     },
 };
 use serde::Deserialize;
@@ -365,6 +366,7 @@ fn capabilities(pull_diagnostics: bool, encoding: PositionEncoding) -> ServerCap
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
         document_formatting_provider: Some(OneOf::Left(true)),
+        document_range_formatting_provider: Some(OneOf::Left(true)),
         workspace: Some(WorkspaceServerCapabilities {
             workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                 supported: Some(true),
@@ -668,6 +670,37 @@ impl Server<'_> {
                             new_text: formatted,
                         }]
                     })
+                });
+                Response::new_ok(request.id, edits)
+            }
+            RangeFormatting::METHOD => {
+                let params: DocumentRangeFormattingParams = serde_json::from_value(request.params)?;
+                let path = uri_path(&params.text_document.uri)?;
+                let source = self.analysis.source(&path).unwrap_or_default().to_owned();
+                let selection = position_offset(&source, params.range.start, self.encoding)
+                    .zip(position_offset(&source, params.range.end, self.encoding));
+                // The whole document goes through the formatter's refuse-when-unsure gate;
+                // the range only decides which of the resulting hunks are handed back.
+                let edits = selection.and_then(|(start, end)| {
+                    let formatted =
+                        wesl_fmt::format(&source, params.options.tab_size as usize, &path)?;
+                    let lines = LineIndex::new(&source, self.encoding);
+                    let edits = wesl_fmt::line_hunks(&source, &formatted)
+                        .into_iter()
+                        .filter(|hunk| hunk.range.start <= end && hunk.range.end >= start)
+                        .filter_map(|hunk| {
+                            let from = lines.offset_to_position(&source, hunk.range.start)?;
+                            let to = lines.offset_to_position(&source, hunk.range.end)?;
+                            Some(TextEdit {
+                                range: LspRange::new(
+                                    LspPosition::new(from.line, from.character),
+                                    LspPosition::new(to.line, to.character),
+                                ),
+                                new_text: hunk.new_text,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    (!edits.is_empty()).then_some(edits)
                 });
                 Response::new_ok(request.id, edits)
             }
