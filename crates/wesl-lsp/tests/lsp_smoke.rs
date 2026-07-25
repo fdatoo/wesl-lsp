@@ -832,3 +832,78 @@ fn folding_ranges_survive_a_broken_buffer() {
 
     client.shutdown();
 }
+
+#[test]
+fn selection_ranges_nest_outward() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = "fn main() {\n    let value = clamp(alpha, 0.0, 1.0);\n}\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["selectionRangeProvider"],
+        json!(true)
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    client.receive_diagnostics(&uri);
+
+    let alpha = source.find("alpha").unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/selectionRange",
+        "params": {
+            "textDocument": {"uri": uri},
+            "positions": [position(source, alpha)]
+        }
+    }));
+    let selections = client.receive_response(2);
+    let innermost = &selections["result"][0];
+    assert_eq!(innermost["range"]["start"], position(source, alpha));
+    assert_eq!(
+        innermost["range"]["end"],
+        position(source, alpha + "alpha".len())
+    );
+
+    // Each parent must strictly contain its child, ending at the whole document.
+    let mut depth = 1;
+    let mut node = innermost;
+    while node.get("parent").is_some_and(|parent| !parent.is_null()) {
+        let parent = &node["parent"];
+        let child_start = &node["range"]["start"];
+        let parent_start = &parent["range"]["start"];
+        assert!(
+            parent_start["line"].as_u64() < child_start["line"].as_u64()
+                || (parent_start["line"] == child_start["line"]
+                    && parent_start["character"].as_u64() <= child_start["character"].as_u64()),
+            "parent must start at or before child: {selections:#?}"
+        );
+        node = parent;
+        depth += 1;
+    }
+    assert!(depth >= 4, "expected a multi-level chain: {selections:#?}");
+    assert_eq!(node["range"]["start"], json!({"line": 0, "character": 0}));
+
+    client.shutdown();
+}

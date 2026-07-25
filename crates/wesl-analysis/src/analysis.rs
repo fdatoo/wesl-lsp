@@ -289,6 +289,13 @@ impl AnalysisHost {
             .unwrap_or_default()
     }
 
+    /// Innermost-first chain of ranges around `offset`, also purely syntactic.
+    pub fn selection_ranges(&self, path: &Path, offset: usize) -> Vec<Range<usize>> {
+        self.source(path)
+            .map(|source| crate::selection_ranges(source, offset))
+            .unwrap_or_default()
+    }
+
     pub fn document_highlights(&mut self, path: &Path, offset: usize) -> Vec<Range<usize>> {
         self.ensure_package(path).document_highlights(path, offset)
     }

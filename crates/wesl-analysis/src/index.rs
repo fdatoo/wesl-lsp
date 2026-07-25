@@ -1310,7 +1310,7 @@ fn identifier_ranges(source: &str, expected: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
-fn tokens(source: &str) -> Vec<(&str, Range<usize>)> {
+pub(crate) fn tokens(source: &str) -> Vec<(&str, Range<usize>)> {
     let bytes = source.as_bytes();
     let mut output = Vec::new();
     let mut index = 0;

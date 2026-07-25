@@ -19,7 +19,8 @@ use lsp_types::{
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
     InsertTextFormat, Location as LspLocation, MarkupContent, MarkupKind, OneOf,
     Position as LspPosition, PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange,
-    ReferenceParams, RenameOptions, RenameParams, ServerCapabilities, SymbolInformation,
+    ReferenceParams, RenameOptions, RenameParams, SelectionRange, SelectionRangeParams,
+    SelectionRangeProviderCapability, ServerCapabilities, SymbolInformation,
     SymbolKind as LspSymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit,
     WorkspaceSymbolParams, WorkspaceSymbolResponse,
@@ -30,7 +31,8 @@ use lsp_types::{
     request::{
         Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest,
         Formatting, GotoDefinition, HoverRequest, PrepareRenameRequest, References, Rename,
-        Request as RequestTrait, WorkspaceConfiguration, WorkspaceSymbolRequest,
+        Request as RequestTrait, SelectionRangeRequest, WorkspaceConfiguration,
+        WorkspaceSymbolRequest,
     },
 };
 use serde::Deserialize;
@@ -175,6 +177,7 @@ fn capabilities() -> ServerCapabilities {
         document_highlight_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+        selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".to_owned()]),
@@ -413,6 +416,26 @@ impl Server<'_> {
                         message.to_owned(),
                     ),
                 }
+            }
+            SelectionRangeRequest::METHOD => {
+                let params: SelectionRangeParams = serde_json::from_value(request.params)?;
+                let path = uri_path(&params.text_document.uri)?;
+                let source = self.analysis.source(&path).unwrap_or_default().to_owned();
+                let lines = LineIndex::new(&source);
+                let result = params
+                    .positions
+                    .into_iter()
+                    .map(|position| {
+                        position_offset(&source, position)
+                            .map(|offset| self.analysis.selection_ranges(&path, offset))
+                            .and_then(|ranges| lsp_selection_range(&source, &lines, ranges))
+                            .unwrap_or_else(|| SelectionRange {
+                                range: LspRange::new(position, position),
+                                parent: None,
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                Response::new_ok(request.id, result)
             }
             FoldingRangeRequest::METHOD => {
                 let params: FoldingRangeParams = serde_json::from_value(request.params)?;
@@ -695,6 +718,27 @@ fn lsp_location(location: wesl_analysis::Location) -> Option<LspLocation> {
         Url::from_file_path(&location.path).ok()?,
         lsp_range_for_file(&location.path, location.range)?,
     ))
+}
+
+/// Folds the innermost-first chain into the protocol's outermost-rooted linked list.
+fn lsp_selection_range(
+    source: &str,
+    lines: &LineIndex,
+    ranges: Vec<std::ops::Range<usize>>,
+) -> Option<SelectionRange> {
+    let mut parent: Option<Box<SelectionRange>> = None;
+    for range in ranges.into_iter().rev() {
+        let start = lines.offset_to_position(source, range.start)?;
+        let end = lines.offset_to_position(source, range.end)?;
+        parent = Some(Box::new(SelectionRange {
+            range: LspRange::new(
+                LspPosition::new(start.line, start.character),
+                LspPosition::new(end.line, end.character),
+            ),
+            parent,
+        }));
+    }
+    parent.map(|innermost| *innermost)
 }
 
 /// Brace regions keep their closing line visible, because collapsing a function should still
