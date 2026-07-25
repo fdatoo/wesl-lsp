@@ -1,12 +1,13 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
+use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     ConfigurationItem, ConfigurationParams, Diagnostic as LspDiagnostic, DiagnosticOptions,
@@ -31,10 +32,11 @@ use lsp_types::{
     SaveOptions, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
     ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
     SignatureInformation, SymbolInformation, SymbolKind as LspSymbolKind,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkDoneProgressOptions,
-    WorkspaceEdit, WorkspaceFileOperationsServerCapabilities, WorkspaceFoldersServerCapabilities,
-    WorkspaceServerCapabilities, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    TextDocumentContentChangeEvent, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
+    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceFileOperationsServerCapabilities,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
     notification::{
         DidChangeConfiguration, DidChangeTextDocument, DidChangeWorkspaceFolders,
         DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
@@ -215,6 +217,7 @@ fn main() -> Result<()> {
         workspace_folders,
         encoding,
         pending_configuration: None,
+        shutting_down: false,
     };
     server.run()?;
     drop(server);
@@ -426,6 +429,8 @@ struct Server<'a> {
     /// Set while a runtime settings refresh is in flight, so its response is recognised in
     /// the main loop rather than blocking for it.
     pending_configuration: Option<RequestId>,
+    /// True between `shutdown` and `exit`, during which further requests are refused.
+    shutting_down: bool,
 }
 
 impl Server<'_> {
@@ -452,14 +457,38 @@ impl Server<'_> {
 
             if let Some(message) = message {
                 match message {
+                    // Shutdown is handled here rather than via `Connection::handle_shutdown`,
+                    // which blocks for `exit` and errors on anything else that arrives. The
+                    // specification instead requires post-shutdown requests to be refused with
+                    // InvalidRequest while the server stays up until `exit`.
+                    Message::Request(request) if request.method == "shutdown" => {
+                        self.shutting_down = true;
+                        self.connection
+                            .sender
+                            .send(Message::Response(Response::new_ok(request.id, ())))?;
+                    }
+                    Message::Request(request) if self.shutting_down => {
+                        self.connection
+                            .sender
+                            .send(Message::Response(Response::new_err(
+                                request.id,
+                                ErrorCode::InvalidRequest as i32,
+                                "server is shutting down".to_owned(),
+                            )))?;
+                    }
                     Message::Request(request) => {
-                        if self.connection.handle_shutdown(&request)? {
-                            break;
-                        }
                         self.handle_request(request)?;
                     }
+                    Message::Notification(notification) if notification.method == "exit" => break,
                     Message::Notification(notification) => {
-                        self.handle_notification(notification)?
+                        let method = notification.method.clone();
+                        match catch_unwind(AssertUnwindSafe(|| {
+                            self.handle_notification(notification)
+                        })) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => log::warn!("notification {method} failed: {error}"),
+                            Err(_) => log::error!("notification {method} panicked"),
+                        }
                     }
                     Message::Response(response) => {
                         if self.pending_configuration.as_ref() == Some(&response.id) {
@@ -562,27 +591,15 @@ impl Server<'_> {
                 if params.content_changes.is_empty() {
                     return Ok(());
                 }
-                let mut text = self.analysis.source(&path).unwrap_or_default().to_owned();
-                for change in params.content_changes {
-                    match change.range {
-                        // A ranged change is incremental; both endpoints must be resolved
-                        // against the text as it stands before this change is applied.
-                        Some(range) => {
-                            let start = position_offset(&text, range.start, self.encoding);
-                            let end = position_offset(&text, range.end, self.encoding);
-                            match (start, end) {
-                                (Some(start), Some(end)) if start <= end => {
-                                    text.replace_range(start..end, &change.text);
-                                }
-                                _ => log::warn!(
-                                    "ignoring out-of-range change for {}; the buffer may be \
-                                     stale until the next save",
-                                    path.display()
-                                ),
-                            }
-                        }
-                        None => text = change.text,
-                    }
+                let before = self.analysis.source(&path).unwrap_or_default();
+                let (text, rejected) =
+                    apply_content_changes(before, &params.content_changes, self.encoding);
+                if rejected > 0 {
+                    log::warn!(
+                        "ignored {rejected} out-of-range change(s) for {}; the buffer may be \
+                         stale until the next save",
+                        path.display()
+                    );
                 }
                 self.versions
                     .insert(path.clone(), params.text_document.version);
@@ -614,10 +631,40 @@ impl Server<'_> {
         Ok(())
     }
 
+    /// One request must never take the whole server down. A handler that panics, or that
+    /// rejects malformed params, fails that request alone — the editor keeps language support
+    /// for everything else instead of silently losing it until restart.
     fn handle_request(&mut self, request: Request) -> Result<()> {
         let started = Instant::now();
+        let id = request.id.clone();
         let method = request.method.clone();
-        let response = match method.as_str() {
+
+        let dispatched = catch_unwind(AssertUnwindSafe(|| self.dispatch(request)));
+        let response = match dispatched {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                log::warn!("{method} failed: {error}");
+                Response::new_err(id, ErrorCode::InvalidParams as i32, error.to_string())
+            }
+            Err(_) => {
+                log::error!("{method} panicked");
+                Response::new_err(
+                    id,
+                    ErrorCode::InternalError as i32,
+                    format!("internal error handling {method}"),
+                )
+            }
+        };
+        if self.log_timing {
+            log::info!("{} completed in {:?}", method, started.elapsed());
+        }
+        self.connection.sender.send(Message::Response(response))?;
+        Ok(())
+    }
+
+    fn dispatch(&mut self, request: Request) -> Result<Response> {
+        let method = request.method.clone();
+        Ok(match method.as_str() {
             HoverRequest::METHOD => {
                 let params: HoverParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document_position_params.text_document.uri)?;
@@ -1025,13 +1072,12 @@ impl Server<'_> {
                     .collect();
                 Response::new_ok(request.id, DocumentSymbolResponse::Nested(symbols))
             }
-            _ => Response::new_ok(request.id, serde_json::Value::Null),
-        };
-        if self.log_timing {
-            log::info!("{} completed in {:?}", method, started.elapsed());
-        }
-        self.connection.sender.send(Message::Response(response))?;
-        Ok(())
+            _ => Response::new_err(
+                request.id,
+                ErrorCode::MethodNotFound as i32,
+                format!("unsupported method {method}"),
+            ),
+        })
     }
 
     fn flush_due_diagnostics(&mut self) -> Result<()> {
@@ -1195,6 +1241,38 @@ fn completion_item(
         additional_text_edits,
         ..CompletionItem::default()
     })
+}
+
+/// Applies content changes in order, returning the new text and how many were rejected.
+///
+/// A ranged change is incremental, so both endpoints resolve against the text as it stands
+/// immediately before that change — not against the original. Getting this wrong desynchronises
+/// the server's buffer from the editor's silently: no error is raised, every later answer is
+/// computed against the wrong text, and only a save resynchronises. An out-of-range change is
+/// skipped rather than guessed at, for the same reason.
+fn apply_content_changes(
+    before: &str,
+    changes: &[TextDocumentContentChangeEvent],
+    encoding: PositionEncoding,
+) -> (String, usize) {
+    let mut text = before.to_owned();
+    let mut rejected = 0;
+    for change in changes {
+        match change.range {
+            Some(range) => {
+                let start = position_offset(&text, range.start, encoding);
+                let end = position_offset(&text, range.end, encoding);
+                match (start, end) {
+                    (Some(start), Some(end)) if start <= end => {
+                        text.replace_range(start..end, &change.text);
+                    }
+                    _ => rejected += 1,
+                }
+            }
+            None => text = change.text.clone(),
+        }
+    }
+    (text, rejected)
 }
 
 fn position_offset(
@@ -1431,4 +1509,154 @@ fn uri_path(uri: &Url) -> Result<PathBuf> {
         .to_file_path()
         .map_err(|_| anyhow::anyhow!("URI is not a file: {uri}"))?;
     Ok(path.canonicalize().unwrap_or(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_content_changes, position_offset};
+    use lsp_types::{Position as LspPosition, Range as LspRange, TextDocumentContentChangeEvent};
+    use wesl_analysis::{LineIndex, PositionEncoding};
+
+    /// Deterministic so a failure reproduces exactly from the seed printed in the assertion.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            if bound == 0 {
+                0
+            } else {
+                (self.next() % bound as u64) as usize
+            }
+        }
+    }
+
+    fn change(
+        source: &str,
+        range: std::ops::Range<usize>,
+        text: &str,
+        encoding: PositionEncoding,
+    ) -> TextDocumentContentChangeEvent {
+        let lines = LineIndex::new(source, encoding);
+        let start = lines.offset_to_position(source, range.start).unwrap();
+        let end = lines.offset_to_position(source, range.end).unwrap();
+        TextDocumentContentChangeEvent {
+            range: Some(LspRange::new(
+                LspPosition::new(start.line, start.character),
+                LspPosition::new(end.line, end.character),
+            )),
+            range_length: None,
+            text: text.to_owned(),
+        }
+    }
+
+    /// Each ranged change must be interpreted against the text left by the previous one, so a
+    /// batch applied incrementally has to equal the same edits applied directly.
+    #[test]
+    fn incremental_changes_match_direct_application() {
+        const INSERTS: &[&str] = &["", "x", "hello", "\n", "a\nb", "  ", "é", "😀", "};\n"];
+
+        for encoding in [PositionEncoding::Utf16, PositionEncoding::Utf8] {
+            for seed in 1..400u64 {
+                let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+                let mut text = String::from("fn main() {\n    let x = 1;\n    let y = 2;\n}\n");
+                let mut expected = text.clone();
+                let mut batch = Vec::new();
+
+                for _ in 0..rng.below(5) + 1 {
+                    // Pick a valid range over the *current* expected text.
+                    let mut start = rng.below(expected.len() + 1);
+                    while !expected.is_char_boundary(start) {
+                        start -= 1;
+                    }
+                    let mut end = start + rng.below(expected.len() - start + 1);
+                    while !expected.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let insert = INSERTS[rng.below(INSERTS.len())];
+                    batch.push(change(&expected, start..end, insert, encoding));
+                    expected.replace_range(start..end, insert);
+                }
+
+                let (actual, rejected) = apply_content_changes(&text, &batch, encoding);
+                assert_eq!(rejected, 0, "seed {seed}, {encoding:?}: change rejected");
+                assert_eq!(
+                    actual, expected,
+                    "seed {seed}, {encoding:?}: incremental application diverged"
+                );
+                text = actual;
+                assert_eq!(text, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_replacement_discards_what_came_before() {
+        let changes = vec![
+            change("old\n", 0..3, "new", PositionEncoding::Utf16),
+            TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "replaced entirely\n".to_owned(),
+            },
+        ];
+        let (text, rejected) = apply_content_changes("old\n", &changes, PositionEncoding::Utf16);
+        assert_eq!(text, "replaced entirely\n");
+        assert_eq!(rejected, 0);
+    }
+
+    /// An unresolvable range must be skipped and counted, never silently mis-applied.
+    #[test]
+    fn out_of_range_changes_are_rejected_not_guessed() {
+        let source = "fn main() {}\n";
+        let beyond = TextDocumentContentChangeEvent {
+            range: Some(LspRange::new(
+                LspPosition::new(99, 0),
+                LspPosition::new(99, 5),
+            )),
+            range_length: None,
+            text: "x".to_owned(),
+        };
+        let (text, rejected) = apply_content_changes(
+            source,
+            std::slice::from_ref(&beyond),
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(text, source, "buffer must be left untouched");
+        assert_eq!(rejected, 1);
+
+        // A surviving change in the same batch still applies.
+        let good = change(source, 0..2, "FN", PositionEncoding::Utf16);
+        let (text, rejected) =
+            apply_content_changes(source, &[beyond, good], PositionEncoding::Utf16);
+        assert_eq!(text, "FN main() {}\n");
+        assert_eq!(rejected, 1);
+    }
+
+    #[test]
+    fn positions_round_trip_through_both_encodings() {
+        let source = "let e = 😀;\nlet f = é;\n";
+        for encoding in [PositionEncoding::Utf16, PositionEncoding::Utf8] {
+            let lines = LineIndex::new(source, encoding);
+            for offset in 0..=source.len() {
+                if !source.is_char_boundary(offset) {
+                    continue;
+                }
+                let position = lines.offset_to_position(source, offset).unwrap();
+                let lsp = LspPosition::new(position.line, position.character);
+                assert_eq!(
+                    position_offset(source, lsp, encoding),
+                    Some(offset),
+                    "{encoding:?} round trip failed at {offset}"
+                );
+            }
+        }
+    }
 }

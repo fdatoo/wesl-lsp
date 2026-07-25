@@ -275,6 +275,17 @@ Adding a capability means touching four layers in order: `capabilities()`, a `ME
 `handle_request`, an offset-based method on `AnalysisHost`, and a case in `lsp_smoke.rs` — which
 is the only test that exercises protocol wiring.
 
+### Failure isolation
+
+`handle_request` wraps dispatch in `catch_unwind` and turns both panics and deserialization
+errors into per-request error responses. Before that, malformed params or a bad URI returned
+`Err` straight out of the message loop and **terminated the process** — the editor silently
+lost all language support until restart. One bad request must never cost the session.
+
+Shutdown is handled inline rather than through `Connection::handle_shutdown`, which blocks for
+`exit` and errors on anything else arriving meanwhile. The specification instead wants the
+server up until `exit`, refusing intervening requests with `InvalidRequest`.
+
 ## Testing philosophy
 
 The invariant this project defends is **no false diagnostics on valid shaders**. Users abandon a
@@ -301,6 +312,15 @@ language server that lights up correct code.
   It samples: `MAX_PROBES_PER_FILE` caps offsets per shader, because the corpus contains a
   1.5 MB generated file and probing every identifier in it alone runs for minutes. If you widen
   the sample, time it before committing.
+- The `tests` module in `crates/wesl-lsp/src/main.rs` property-tests `apply_content_changes`
+  over hundreds of pseudo-random edit batches in both position encodings. Incremental sync is
+  the server's most dangerous silent-failure mode: a misapplied range desynchronises the
+  buffer from the editor with no error anywhere, and every later answer is computed against
+  the wrong text. The PRNG is seeded deterministically so a failure names a reproducing seed.
+
+  **This test earns its keep only if it can fail.** It was validated by injecting the real bug
+  — resolving each range against the original text instead of the running one — and confirming
+  it caught it. Do that again if you rework the batching.
 
 ## Conventions
 

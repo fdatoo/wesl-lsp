@@ -1711,3 +1711,176 @@ fn on_type_formatting_reindents_the_current_line() {
 
     client.shutdown();
 }
+
+/// Brings a server up on `root` with no special capabilities, returning the client.
+fn start_on(root: &std::path::Path) -> Client {
+    let mut client = Client::start();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    assert_eq!(client.receive_response(1)["id"], 1);
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client
+}
+
+#[test]
+fn malformed_requests_fail_alone_and_the_server_keeps_serving() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = "fn main() { let x = 1; }\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = start_on(&root);
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    client.receive_diagnostics(&uri);
+
+    // Params of the wrong shape entirely. Before handler isolation this propagated out of the
+    // message loop and terminated the process.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/hover",
+        "params": {"nonsense": true}
+    }));
+    let rejected = client.receive_response(2);
+    assert!(rejected["error"].is_object(), "{rejected:#?}");
+
+    // A URI the server cannot turn into a path is likewise a request-level failure.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/documentSymbol",
+        "params": {"textDocument": {"uri": "untitled:Untitled-1"}}
+    }));
+    assert!(client.receive_response(3)["error"].is_object());
+
+    // An unknown method is answered, not ignored.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "textDocument/somethingInvented",
+        "params": {}
+    }));
+    let unknown = client.receive_response(4);
+    assert_eq!(
+        unknown["error"]["code"], -32601,
+        "expected MethodNotFound: {unknown:#?}"
+    );
+
+    // A malformed notification must not kill the loop either.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {"garbage": []}
+    }));
+
+    // The server is still fully alive and answering correctly.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "textDocument/documentSymbol",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let symbols = client.receive_response(5);
+    assert!(
+        symbols["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "main"),
+        "server should still be serving: {symbols:#?}"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn requests_for_unopened_documents_are_answered_not_fatal() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    fs::write(root.join("present.wesl"), "const value = 1;\n").unwrap();
+    let mut client = start_on(&root);
+
+    // Never opened, and does not exist on disk either.
+    let missing = lsp_types::Url::from_file_path(root.join("absent.wesl")).unwrap();
+    for (id, method, params) in [
+        (
+            2,
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": missing}}),
+        ),
+        (
+            3,
+            "textDocument/hover",
+            json!({"textDocument": {"uri": missing}, "position": {"line": 0, "character": 0}}),
+        ),
+        (
+            4,
+            "textDocument/foldingRange",
+            json!({"textDocument": {"uri": missing}}),
+        ),
+        (
+            5,
+            "textDocument/inlayHint",
+            json!({
+                "textDocument": {"uri": missing},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 0}
+                }
+            }),
+        ),
+    ] {
+        client.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let response = client.receive_response(id);
+        assert!(
+            response["error"].is_null(),
+            "{method} on an unopened document should succeed emptily: {response:#?}"
+        );
+    }
+
+    client.shutdown();
+}
+
+#[test]
+fn requests_after_shutdown_are_rejected() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    fs::write(root.join("main.wesl"), "const value = 1;\n").unwrap();
+    let mut client = start_on(&root);
+
+    client.send(json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}));
+    assert!(client.receive_response(2)["error"].is_null());
+
+    // The protocol requires anything after shutdown to be refused.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/documentSymbol",
+        "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(root.join("main.wesl")).unwrap()}}
+    }));
+    let refused = client.receive_response(3);
+    assert!(
+        refused["error"].is_object(),
+        "post-shutdown requests must be refused: {refused:#?}"
+    );
+
+    client.send(json!({"jsonrpc": "2.0", "method": "exit"}));
+    client.input.take();
+    assert!(client.child.wait().unwrap().success());
+}
