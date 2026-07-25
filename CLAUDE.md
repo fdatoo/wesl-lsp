@@ -202,6 +202,8 @@ default.
 | `inlayHints.typeHints` | `true` |
 | `inlayHints.parameterHints` | `true` |
 | `inlayHints.structLayoutHints` | **`false`** |
+| `diagnostics.enabled` | `true` |
+| `diagnostics.pull` | **`false`** |
 
 Layout hints default off deliberately: they annotate every member of every struct with
 roughly 28 characters of virtual text regardless of what the reader is doing, and the
@@ -256,12 +258,18 @@ text as it stands just before that change. `save` is registered with `includeTex
 is an authoritative full resync — that is what bounds the damage if a change ever fails to
 apply, and why the failure path logs and continues rather than trying to guess.
 
-Diagnostics use **exactly one mechanism per session**, negotiated at initialize. A client that
-declares pull support gets `textDocument/diagnostic` and no pushes; everyone else keeps the
-push path, which is what Zed needs. Advertising both would double-report in clients that do
-both, and the specification advises against mixing them. The pull report carries the rest of
-the import closure in `relatedDocuments`, preserving the push path's behaviour of clearing
-stale squiggles in dependents.
+Diagnostics use **exactly one mechanism per session**. Pushing is the default; pull requires
+*both* the client to advertise `textDocument/diagnostic` **and** `diagnostics.pull` to be set.
+Advertising both would double-report in clients that do both, and the specification advises
+against mixing them. The pull report carries the rest of the import closure in
+`relatedDocuments`, preserving the push path's behaviour of clearing stale squiggles in
+dependents.
+
+**Client capability alone is deliberately not enough.** Zed advertises pull support by default
+(`lsp_pull_diagnostics.enabled` is true in its shipped settings), but pull was tried against Zed
+and backed out — the commit "Use push diagnostics for Zed compatibility" removed exactly this
+capability block. Switching on the advertisement would silently put every Zed user back on the
+path that did not work, so it stays opt-in until someone verifies pull against Zed directly.
 
 Deliberately absent, with the reasoning:
 

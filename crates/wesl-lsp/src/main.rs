@@ -113,11 +113,22 @@ impl InlayHintSettings {
 #[serde(default, rename_all = "camelCase")]
 struct DiagnosticSettings {
     enabled: bool,
+    /// Opt in to `textDocument/diagnostic` instead of pushing.
+    ///
+    /// Off by default even for clients that advertise pull support. Zed advertises it (its
+    /// `lsp_pull_diagnostics.enabled` defaults to true) but pull was tried against Zed and
+    /// backed out — see the commit "Use push diagnostics for Zed compatibility", which removed
+    /// exactly this capability. Honouring the advertisement alone would silently put every Zed
+    /// user back on the path that did not work.
+    pull: bool,
 }
 
 impl Default for DiagnosticSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            pull: false,
+        }
     }
 }
 
@@ -161,12 +172,15 @@ fn main() -> Result<()> {
     } else {
         PositionEncoding::Utf16
     };
-    let pull_diagnostics = initialize_params
-        .capabilities
-        .text_document
-        .as_ref()
-        .and_then(|text_document| text_document.diagnostic.as_ref())
-        .is_some();
+    // Both must agree: the client has to support pull *and* the workspace has to ask for it.
+    // Advertising on client capability alone regresses Zed, which advertises pull by default.
+    let pull_diagnostics = configuration.diagnostics.pull
+        && initialize_params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|text_document| text_document.diagnostic.as_ref())
+            .is_some();
     let result = InitializeResult {
         capabilities: capabilities(pull_diagnostics, encoding),
         server_info: Some(lsp_types::ServerInfo {

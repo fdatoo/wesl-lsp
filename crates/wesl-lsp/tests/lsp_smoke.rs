@@ -1217,7 +1217,7 @@ fn pull_capable_clients_get_reports_instead_of_pushes() {
         "method": "initialize",
         "params": {
             "capabilities": {"textDocument": {"diagnostic": {"dynamicRegistration": false}}},
-            "initializationOptions": {"root": root},
+            "initializationOptions": {"root": root, "diagnostics": {"pull": true}},
             "rootUri": null
         }
     }));
@@ -1883,4 +1883,57 @@ fn requests_after_shutdown_are_rejected() {
     client.send(json!({"jsonrpc": "2.0", "method": "exit"}));
     client.input.take();
     assert!(client.child.wait().unwrap().success());
+}
+
+/// Zed advertises pull diagnostics by default, but pull was tried against Zed and backed out.
+/// Client capability alone must therefore not be enough to switch off the push path.
+#[test]
+fn advertising_pull_support_alone_does_not_disable_push() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = "fn main() { let x: bool = 1.0; }\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            // Exactly what Zed sends with its default lsp_pull_diagnostics.enabled = true.
+            "capabilities": {
+                "textDocument": {
+                    "diagnostic": {"dynamicRegistration": true, "relatedDocumentSupport": true}
+                }
+            },
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert!(
+        initialized["result"]["capabilities"]
+            .get("diagnosticProvider")
+            .is_none(),
+        "pull must stay opt-in even when the client advertises it: {initialized:#?}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+
+    // And diagnostics must still arrive unprompted.
+    let published = client.receive_diagnostics(&uri);
+    assert_eq!(
+        published["params"]["diagnostics"][0]["message"], "type mismatch: expected bool, found f32",
+        "{published:#?}"
+    );
+
+    client.shutdown();
 }
