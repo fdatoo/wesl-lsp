@@ -122,6 +122,28 @@ fn position(source: &str, offset: usize) -> Value {
     json!({"line": position.line, "character": position.character})
 }
 
+/// Requests inlay hints over the whole document and returns just the labels.
+fn inlay_labels(client: &mut Client, id: i64, uri: &lsp_types::Url, source: &str) -> Vec<String> {
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "textDocument/inlayHint",
+        "params": {
+            "textDocument": {"uri": uri},
+            "range": {
+                "start": position(source, 0),
+                "end": position(source, source.len())
+            }
+        }
+    }));
+    client.receive_response(id)["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hint| hint["label"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
 #[test]
 fn requests_workspace_configuration_when_initialization_root_is_absent() {
     let temp = tempdir().unwrap();
@@ -1315,6 +1337,79 @@ fn renaming_a_shader_returns_import_edits() {
     assert!(
         client.receive_response(3)["result"].is_null(),
         "no importers means no edit"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn configuration_gates_struct_layout_hints_and_updates_live() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = "struct Sphere {\n    radius: f32,\n    position: vec3<f32>,\n}\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {"workspace": {"configuration": true}},
+            "rootUri": lsp_types::Url::from_file_path(&root).unwrap()
+        }
+    }));
+    assert_eq!(client.receive_response(1)["id"], 1);
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+    // Startup settings request: opt layout hints in.
+    let request = client.receive();
+    assert_eq!(request["method"], "workspace/configuration");
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": request["id"].clone(),
+        "result": [{"root": root, "inlayHints": {"structLayoutHints": true}}]
+    }));
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    client.receive_diagnostics(&uri);
+
+    let enabled = inlay_labels(&mut client, 2, &uri, source);
+    assert!(
+        enabled.iter().any(|label| label.starts_with("offset ")),
+        "opted in, so layout hints should show: {enabled:#?}"
+    );
+
+    // Turn them back off without restarting the server.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {}}
+    }));
+    let refresh = loop {
+        let message = client.receive();
+        if message["method"] == "workspace/configuration" {
+            break message;
+        }
+    };
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": refresh["id"].clone(),
+        "result": [{"root": root, "inlayHints": {"structLayoutHints": false}}]
+    }));
+
+    let disabled = inlay_labels(&mut client, 3, &uri, source);
+    assert!(
+        !disabled.iter().any(|label| label.starts_with("offset ")),
+        "layout hints should be gone after the settings change: {disabled:#?}"
     );
 
     client.shutdown();

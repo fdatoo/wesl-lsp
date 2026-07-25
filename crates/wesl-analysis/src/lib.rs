@@ -20,7 +20,7 @@ pub use index::{
     Completion, CompletionKind, HoverInfo, Location, SourceEdit, Symbol, SymbolKind,
     WorkspaceSymbol,
 };
-pub use inlay::{InlayHint, InlayKind};
+pub use inlay::{InlayHint, InlayHintConfig, InlayKind};
 pub use layout::{MemberLayout, MemberOverrides, align_of, size_of, struct_layout};
 pub use line_index::{LineIndex, Position};
 pub use overlay::OverlayResolver;

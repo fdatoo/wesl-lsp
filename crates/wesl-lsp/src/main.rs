@@ -34,8 +34,8 @@ use lsp_types::{
     WorkspaceEdit, WorkspaceFileOperationsServerCapabilities, WorkspaceServerCapabilities,
     WorkspaceSymbolParams, WorkspaceSymbolResponse,
     notification::{
-        DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-        Notification as NotificationTrait, PublishDiagnostics,
+        DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
+        DidSaveTextDocument, Notification as NotificationTrait, PublishDiagnostics,
     },
     request::{
         Completion, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
@@ -47,16 +47,72 @@ use lsp_types::{
 use serde::Deserialize;
 use wesl_analysis::{
     AnalysisHost, Completion as AnalysisCompletion, CompletionKind, DiagnosticSeverity, FoldKind,
-    FoldingRange as AnalysisFoldingRange, InlayHint as AnalysisInlayHint, InlayKind, LineIndex,
-    SignatureHelp as AnalysisSignatureHelp, Symbol, SymbolKind,
+    FoldingRange as AnalysisFoldingRange, InlayHint as AnalysisInlayHint, InlayHintConfig,
+    InlayKind, LineIndex, SignatureHelp as AnalysisSignatureHelp, Symbol, SymbolKind,
     WorkspaceSymbol as AnalysisWorkspaceSymbol,
 };
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
 
-#[derive(Default, Deserialize)]
-struct InitializationOptions {
+/// Settings under the `wesl-lsp` section, also accepted verbatim as `initializationOptions`.
+/// Every field is optional so a partial settings object leaves the rest at its default.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Configuration {
     root: Option<PathBuf>,
+    inlay_hints: InlayHintSettings,
+    diagnostics: DiagnosticSettings,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct InlayHintSettings {
+    enabled: bool,
+    type_hints: bool,
+    parameter_hints: bool,
+    /// Off by default: see [`wesl_analysis::InlayHintConfig`].
+    struct_layout_hints: bool,
+}
+
+impl Default for InlayHintSettings {
+    fn default() -> Self {
+        let hints = InlayHintConfig::default();
+        Self {
+            enabled: true,
+            type_hints: hints.type_hints,
+            parameter_hints: hints.parameter_hints,
+            struct_layout_hints: hints.struct_layout_hints,
+        }
+    }
+}
+
+impl InlayHintSettings {
+    fn to_config(self) -> InlayHintConfig {
+        if !self.enabled {
+            return InlayHintConfig {
+                type_hints: false,
+                parameter_hints: false,
+                struct_layout_hints: false,
+            };
+        }
+        InlayHintConfig {
+            type_hints: self.type_hints,
+            parameter_hints: self.parameter_hints,
+            struct_layout_hints: self.struct_layout_hints,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct DiagnosticSettings {
+    enabled: bool,
+}
+
+impl Default for DiagnosticSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 fn main() -> Result<()> {
@@ -78,13 +134,12 @@ fn main() -> Result<()> {
         .and_then(|folders| folders.first())
         .map(|folder| folder.uri.clone())
         .or_else(|| initialize_params.root_uri.clone());
-    let mut options: InitializationOptions = initialize_params
+    let mut configuration: Configuration = initialize_params
         .initialization_options
-        .map(serde_json::from_value)
-        .transpose()
-        .context("invalid initializationOptions")?
+        .as_ref()
+        .map(parse_configuration)
         .unwrap_or_default();
-    options.root = options
+    configuration.root = configuration
         .root
         .map(|root| resolve_workspace_root(root, configuration_scope.as_ref()));
     let pull_diagnostics = initialize_params
@@ -102,20 +157,30 @@ fn main() -> Result<()> {
     };
     connection.initialize_finish(initialize_id, serde_json::to_value(result)?)?;
     let mut startup_messages = VecDeque::new();
-    if options.root.is_none() && supports_configuration {
-        let (root, queued) = request_workspace_root(&connection, configuration_scope.clone())?;
-        options.root = root;
+    if supports_configuration {
+        let (fetched, queued) = request_configuration_blocking(
+            &connection,
+            configuration_scope.clone(),
+            configuration.root.clone(),
+        )?;
+        if let Some(fetched) = fetched {
+            configuration = fetched;
+        }
         startup_messages = queued;
     }
 
     let mut server = Server {
         connection: &connection,
-        analysis: AnalysisHost::new(options.root),
+        analysis: AnalysisHost::new(configuration.root.clone()),
         versions: HashMap::new(),
         pending: HashMap::new(),
         startup_messages,
         log_timing,
         push_diagnostics: !pull_diagnostics,
+        configuration,
+        configuration_scope,
+        supports_configuration,
+        pending_configuration: None,
     };
     server.run()?;
     drop(server);
@@ -124,22 +189,36 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn request_workspace_root(
-    connection: &Connection,
-    scope_uri: Option<Url>,
-) -> Result<(Option<PathBuf>, VecDeque<Message>)> {
-    let id = RequestId::from("wesl-lsp/workspace-configuration".to_owned());
-    let request = Request::new(
-        id.clone(),
+const CONFIGURATION_REQUEST_ID: &str = "wesl-lsp/workspace-configuration";
+
+fn configuration_request(id: RequestId, scope_uri: Option<Url>) -> Request {
+    Request::new(
+        id,
         WorkspaceConfiguration::METHOD.to_owned(),
         ConfigurationParams {
             items: vec![ConfigurationItem {
-                scope_uri: scope_uri.clone(),
+                scope_uri,
                 section: Some("wesl-lsp".to_owned()),
             }],
         },
-    );
-    connection.sender.send(Message::Request(request))?;
+    )
+}
+
+/// Startup-only: blocks for the response, queueing anything that arrives first so no
+/// notification is lost. Runtime refreshes must not use this shape — they go through the
+/// normal loop instead, see [`Server::request_configuration`].
+fn request_configuration_blocking(
+    connection: &Connection,
+    scope_uri: Option<Url>,
+    fallback_root: Option<PathBuf>,
+) -> Result<(Option<Configuration>, VecDeque<Message>)> {
+    let id = RequestId::from(CONFIGURATION_REQUEST_ID.to_owned());
+    connection
+        .sender
+        .send(Message::Request(configuration_request(
+            id.clone(),
+            scope_uri.clone(),
+        )))?;
 
     let mut queued = VecDeque::new();
     loop {
@@ -150,25 +229,41 @@ fn request_workspace_root(
         if let Message::Response(response) = &message
             && response.id == id
         {
-            let root = response
+            let configuration = response
                 .result
                 .as_ref()
-                .and_then(|result| result.as_array())
-                .and_then(|values| values.first())
-                .and_then(configuration_root)
-                .map(|root| resolve_workspace_root(root, scope_uri.as_ref()));
-            return Ok((root, queued));
+                .map(|result| settings_from_response(result, scope_uri.as_ref(), fallback_root));
+            return Ok((configuration, queued));
         }
         queued.push_back(message);
     }
 }
 
-fn configuration_root(value: &serde_json::Value) -> Option<PathBuf> {
-    value
-        .get("root")
-        .or_else(|| value.get("initializationOptions")?.get("root"))
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)
+/// Reads the first configuration item, tolerating both a bare settings object and one nested
+/// under `initializationOptions`, and keeps `fallback_root` when the client supplies no root.
+fn settings_from_response(
+    result: &serde_json::Value,
+    scope_uri: Option<&Url>,
+    fallback_root: Option<PathBuf>,
+) -> Configuration {
+    let mut configuration = result
+        .as_array()
+        .and_then(|values| values.first())
+        .map(parse_configuration)
+        .unwrap_or_default();
+    configuration.root = configuration
+        .root
+        .map(|root| resolve_workspace_root(root, scope_uri))
+        .or(fallback_root);
+    configuration
+}
+
+fn parse_configuration(value: &serde_json::Value) -> Configuration {
+    let value = value.get("initializationOptions").unwrap_or(value);
+    serde_json::from_value(value.clone()).unwrap_or_else(|error| {
+        log::warn!("ignoring invalid wesl-lsp settings: {error}");
+        Configuration::default()
+    })
 }
 
 fn resolve_workspace_root(root: PathBuf, scope_uri: Option<&Url>) -> PathBuf {
@@ -263,6 +358,12 @@ struct Server<'a> {
     log_timing: bool,
     /// False when the client pulls instead; see [`capabilities`].
     push_diagnostics: bool,
+    configuration: Configuration,
+    configuration_scope: Option<Url>,
+    supports_configuration: bool,
+    /// Set while a runtime settings refresh is in flight, so its response is recognised in
+    /// the main loop rather than blocking for it.
+    pending_configuration: Option<RequestId>,
 }
 
 impl Server<'_> {
@@ -298,7 +399,18 @@ impl Server<'_> {
                     Message::Notification(notification) => {
                         self.handle_notification(notification)?
                     }
-                    Message::Response(_) => {}
+                    Message::Response(response) => {
+                        if self.pending_configuration.as_ref() == Some(&response.id) {
+                            self.pending_configuration = None;
+                            if let Some(result) = &response.result {
+                                self.apply_configuration(settings_from_response(
+                                    result,
+                                    self.configuration_scope.as_ref(),
+                                    self.configuration.root.clone(),
+                                ))?;
+                            }
+                        }
+                    }
                 }
             }
             self.flush_due_diagnostics()?;
@@ -306,9 +418,41 @@ impl Server<'_> {
         Ok(())
     }
 
+    /// Asks the client for settings without blocking; the answer is picked up in [`Self::run`].
+    fn request_configuration(&mut self) -> Result<()> {
+        if !self.supports_configuration || self.pending_configuration.is_some() {
+            return Ok(());
+        }
+        let id = RequestId::from(CONFIGURATION_REQUEST_ID.to_owned());
+        self.pending_configuration = Some(id.clone());
+        self.connection
+            .sender
+            .send(Message::Request(configuration_request(
+                id,
+                self.configuration_scope.clone(),
+            )))?;
+        Ok(())
+    }
+
+    fn apply_configuration(&mut self, configuration: Configuration) -> Result<()> {
+        let root_changed = configuration.root != self.configuration.root;
+        self.configuration = configuration;
+        if root_changed {
+            // Discards every cached package, so the next request reindexes under the new root.
+            self.analysis
+                .set_root_override(self.configuration.root.clone());
+        }
+        // Diagnostics may have been switched on or off, and a new root changes what resolves.
+        for path in self.versions.keys().cloned().collect::<Vec<_>>() {
+            self.publish(&path)?;
+        }
+        Ok(())
+    }
+
     fn handle_notification(&mut self, notification: Notification) -> Result<()> {
         log::debug!("notification {}", notification.method);
         match notification.method.as_str() {
+            DidChangeConfiguration::METHOD => self.request_configuration()?,
             DidOpenTextDocument::METHOD => {
                 let params: DidOpenTextDocumentParams =
                     serde_json::from_value(notification.params)?;
@@ -582,9 +726,10 @@ impl Server<'_> {
                 let lines = LineIndex::new(&source);
                 let start = position_offset(&source, params.range.start).unwrap_or(0);
                 let end = position_offset(&source, params.range.end).unwrap_or(source.len());
+                let hints = self.configuration.inlay_hints.to_config();
                 let result = self
                     .analysis
-                    .inlay_hints(&path, start..end)
+                    .inlay_hints(&path, start..end, hints)
                     .into_iter()
                     .filter_map(|hint| lsp_inlay_hint(&source, &lines, hint))
                     .collect::<Vec<_>>();
@@ -734,6 +879,11 @@ impl Server<'_> {
     fn publish(&mut self, path: &Path) -> Result<()> {
         if !self.push_diagnostics {
             return Ok(());
+        }
+        // Publish an empty set rather than skipping, so turning diagnostics off clears what
+        // is already on screen instead of freezing it.
+        if !self.configuration.diagnostics.enabled {
+            return self.send_diagnostics(path, Vec::new());
         }
         let started = Instant::now();
         let batch = self.analysis.diagnostic_batch(path);

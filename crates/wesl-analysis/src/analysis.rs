@@ -8,8 +8,8 @@ use std::{
 use wgsl_parse::{parse_str, syntax::TranslationUnit};
 
 use crate::{
-    Completion, FoldingRange, HoverInfo, InlayHint, Location, OverlayResolver, PackageIndex,
-    SignatureHelp, SourceEdit, Symbol, WorkspaceSymbol, dialect, discover_root,
+    Completion, FoldingRange, HoverInfo, InlayHint, InlayHintConfig, Location, OverlayResolver,
+    PackageIndex, SignatureHelp, SourceEdit, Symbol, WorkspaceSymbol, dialect, discover_root,
 };
 use wesl::Resolver;
 
@@ -327,8 +327,16 @@ impl AnalysisHost {
         self.ensure_package(path).signature_help(path, offset)
     }
 
-    pub fn inlay_hints(&mut self, path: &Path, range: Range<usize>) -> Vec<InlayHint> {
-        self.ensure_package(path).inlay_hints(path, range)
+    pub fn inlay_hints(
+        &mut self,
+        path: &Path,
+        range: Range<usize>,
+        config: InlayHintConfig,
+    ) -> Vec<InlayHint> {
+        if config.is_empty() {
+            return Vec::new();
+        }
+        self.ensure_package(path).inlay_hints(path, range, config)
     }
 
     pub fn completions(&mut self, path: &Path, offset: usize) -> Vec<Completion> {
@@ -627,6 +635,75 @@ mod tests {
         assert!(host.workspace_symbols("").len() >= 3);
     }
 
+    /// Layout hints are off by default, so tests that want every kind opt in explicitly.
+    fn all_hints() -> crate::InlayHintConfig {
+        crate::InlayHintConfig {
+            struct_layout_hints: true,
+            ..crate::InlayHintConfig::default()
+        }
+    }
+
+    #[test]
+    fn inlay_hint_config_gates_each_kind() {
+        use crate::{InlayHintConfig, InlayKind};
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("main.wesl");
+        let source = concat!(
+            "struct Camera { origin: vec3<f32>, focal: f32, }\n",
+            "fn shade(albedo: f32, roughness: f32) -> f32 { return albedo * roughness; }\n",
+            "fn main() { let lit = shade(1.0, 0.5); }\n",
+        );
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::new(Some(root));
+        host.open(path.clone(), source.into());
+
+        let mut kinds = |config| {
+            host.inlay_hints(&path, 0..source.len(), config)
+                .into_iter()
+                .map(|hint| hint.kind)
+                .collect::<Vec<_>>()
+        };
+
+        // The default must not include layout hints — they are opt-in.
+        let default_kinds = kinds(InlayHintConfig::default());
+        assert!(
+            !default_kinds.contains(&InlayKind::Layout),
+            "layout hints must be off by default: {default_kinds:?}"
+        );
+        assert!(
+            default_kinds.contains(&InlayKind::Type),
+            "{default_kinds:?}"
+        );
+        assert!(
+            default_kinds.contains(&InlayKind::Parameter),
+            "{default_kinds:?}"
+        );
+
+        // Opting in adds them without disturbing the others.
+        assert!(kinds(all_hints()).contains(&InlayKind::Layout));
+
+        // Each kind gates independently.
+        let only_layout = kinds(InlayHintConfig {
+            type_hints: false,
+            parameter_hints: false,
+            struct_layout_hints: true,
+        });
+        assert!(
+            only_layout.iter().all(|kind| *kind == InlayKind::Layout),
+            "{only_layout:?}"
+        );
+
+        let nothing = InlayHintConfig {
+            type_hints: false,
+            parameter_hints: false,
+            struct_layout_hints: false,
+        };
+        assert!(nothing.is_empty());
+        assert!(kinds(nothing).is_empty());
+    }
+
     #[test]
     fn inlay_hints_show_inferred_types_and_parameter_names() {
         use crate::InlayKind;
@@ -646,7 +723,7 @@ mod tests {
         let mut host = AnalysisHost::new(Some(root));
         host.open(path.clone(), source.into());
 
-        let hints = host.inlay_hints(&path, 0..source.len());
+        let hints = host.inlay_hints(&path, 0..source.len(), all_hints());
         let rendered = hints
             .iter()
             .map(|hint| (hint.kind, hint.label.as_str()))
@@ -687,7 +764,7 @@ mod tests {
 
         // Requesting a sub-range returns only the hints inside it.
         let second_line = source.find("let lit").unwrap();
-        let narrowed = host.inlay_hints(&path, second_line..source.len());
+        let narrowed = host.inlay_hints(&path, second_line..source.len(), all_hints());
         assert!(narrowed.iter().all(|hint| hint.offset >= second_line));
         assert!(!narrowed.is_empty());
     }
@@ -713,7 +790,7 @@ mod tests {
         host.open(path.clone(), source.into());
 
         let layout = host
-            .inlay_hints(&path, 0..source.len())
+            .inlay_hints(&path, 0..source.len(), all_hints())
             .into_iter()
             .filter(|hint| hint.kind == InlayKind::Layout)
             .map(|hint| hint.label)
@@ -744,7 +821,7 @@ mod tests {
         host.open(path.clone(), source.into());
 
         let labels = host
-            .inlay_hints(&path, 0..source.len())
+            .inlay_hints(&path, 0..source.len(), all_hints())
             .into_iter()
             .filter(|hint| hint.kind == InlayKind::Parameter)
             .map(|hint| hint.label)

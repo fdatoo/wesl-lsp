@@ -9,7 +9,7 @@ use std::{
 use crate::{
     builtins::{BUILTIN_FUNCTIONS, BUILTIN_TYPES, builtin},
     dialect,
-    inlay::{InlayHint, InlayKind},
+    inlay::{InlayHint, InlayHintConfig, InlayKind},
     layout::{MemberOverrides, struct_layout},
     signature::{
         CallSite, SignatureHelp, SignatureInfo, call_sites, enclosing_call, parameter_names,
@@ -350,49 +350,62 @@ impl PackageIndex {
 
     /// Hints whose anchor falls inside `range`. Type hints need the module to have parsed;
     /// parameter hints are token-based and survive a broken buffer.
-    pub(crate) fn inlay_hints(&self, path: &Path, range: Range<usize>) -> Vec<InlayHint> {
+    pub(crate) fn inlay_hints(
+        &self,
+        path: &Path,
+        range: Range<usize>,
+        config: InlayHintConfig,
+    ) -> Vec<InlayHint> {
         let Some(file) = self.files.get(path) else {
             return Vec::new();
         };
         let mut hints = Vec::new();
 
-        if let Some(module) = file.module.as_deref() {
+        if let Some(module) = file.module.as_deref()
+            && (config.type_hints || config.struct_layout_hints)
+        {
             let mut active = HashSet::from([path.to_path_buf()]);
             let imports = self.imported_type_environment(file, &mut active);
-            hints.extend(struct_layout_hints(module, imports.clone(), &range));
-            for (declaration, name, ty) in inferred_declarations(module, imports) {
-                if let Some(identifier) = find_identifier(&file.source, declaration, &name)
-                    && range.contains(&identifier.end)
-                {
-                    hints.push(InlayHint {
-                        offset: identifier.end,
-                        label: format!(": {ty}"),
-                        kind: InlayKind::Type,
-                    });
+            if config.struct_layout_hints {
+                hints.extend(struct_layout_hints(module, imports.clone(), &range));
+            }
+            if config.type_hints {
+                for (declaration, name, ty) in inferred_declarations(module, imports) {
+                    if let Some(identifier) = find_identifier(&file.source, declaration, &name)
+                        && range.contains(&identifier.end)
+                    {
+                        hints.push(InlayHint {
+                            offset: identifier.end,
+                            label: format!(": {ty}"),
+                            kind: InlayKind::Type,
+                        });
+                    }
                 }
             }
         }
 
-        for call in call_sites(&file.source) {
-            let Some(label) = self.callee_label(path, &call) else {
-                continue;
-            };
-            let names = parameter_names(&label);
-            for (index, argument) in call.arguments.iter().enumerate() {
-                let Some(name) = names.get(index).filter(|name| !name.is_empty()) else {
-                    break;
-                };
-                // Labelling `shade(albedo)` with `albedo:` is pure noise.
-                if !range.contains(argument)
-                    || identifier_at(&file.source, *argument).as_deref() == Some(name.as_str())
-                {
+        if config.parameter_hints {
+            for call in call_sites(&file.source) {
+                let Some(label) = self.callee_label(path, &call) else {
                     continue;
+                };
+                let names = parameter_names(&label);
+                for (index, argument) in call.arguments.iter().enumerate() {
+                    let Some(name) = names.get(index).filter(|name| !name.is_empty()) else {
+                        break;
+                    };
+                    // Labelling `shade(albedo)` with `albedo:` is pure noise.
+                    if !range.contains(argument)
+                        || identifier_at(&file.source, *argument).as_deref() == Some(name.as_str())
+                    {
+                        continue;
+                    }
+                    hints.push(InlayHint {
+                        offset: *argument,
+                        label: format!("{name}:"),
+                        kind: InlayKind::Parameter,
+                    });
                 }
-                hints.push(InlayHint {
-                    offset: *argument,
-                    label: format!("{name}:"),
-                    kind: InlayKind::Parameter,
-                });
             }
         }
 

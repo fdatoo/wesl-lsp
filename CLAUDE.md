@@ -157,6 +157,36 @@ candidate through `module_file` before touching any text, so a module of the sam
 another package is never edited, and the path match requires a segment boundary so
 `package::mesh` does not match inside `package::mesh_utils`.
 
+### Configuration
+
+Settings live under the `wesl-lsp` section and are also accepted verbatim as
+`initializationOptions`. Every field is optional; a partial object leaves the rest at its
+default.
+
+| Setting | Default |
+|---|---|
+| `root` | discovered |
+| `inlayHints.enabled` | `true` |
+| `inlayHints.typeHints` | `true` |
+| `inlayHints.parameterHints` | `true` |
+| `inlayHints.structLayoutHints` | **`false`** |
+
+Layout hints default off deliberately: they annotate every member of every struct with
+roughly 28 characters of virtual text regardless of what the reader is doing, and the
+information is only actionable while reconciling a shader struct against a host-side one.
+
+**Gate hint kinds in `wesl-analysis`, not in the protocol layer.** `InlayHintConfig` is
+threaded down to `PackageIndex::inlay_hints`, which skips the work rather than filtering
+results — layout and type hints each run a type-checker pass, so computing a disabled kind
+and discarding it would cost a full pass per keystroke.
+
+Two request shapes exist for settings and they are not interchangeable.
+`request_configuration_blocking` is startup-only: it blocks for the response and queues
+anything arriving first into `startup_messages`. Runtime refreshes triggered by
+`didChangeConfiguration` go through `Server::request_configuration`, which sends the request
+and picks the answer up in the normal loop via `pending_configuration`. Blocking at runtime
+would deadlock against a client that is waiting on us.
+
 Inlay hints come from three sources. Type hints reuse the type checker:
 `inferred_declarations` runs the same pass as `analyze_module` but keeps the type it settled
 on for each declaration that had no written annotation, so hints can never disagree with
