@@ -14,16 +14,17 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind,
     DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-    FoldingRange as LspFoldingRange, FoldingRangeKind, FoldingRangeParams,
+    Documentation, FoldingRange as LspFoldingRange, FoldingRangeKind, FoldingRangeParams,
     FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
     InsertTextFormat, Location as LspLocation, MarkupContent, MarkupKind, OneOf,
-    Position as LspPosition, PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange,
-    ReferenceParams, RenameOptions, RenameParams, SelectionRange, SelectionRangeParams,
-    SelectionRangeProviderCapability, ServerCapabilities, SymbolInformation,
-    SymbolKind as LspSymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    ParameterInformation, ParameterLabel, Position as LspPosition, PrepareRenameResponse,
+    PublishDiagnosticsParams, Range as LspRange, ReferenceParams, RenameOptions, RenameParams,
+    SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability, ServerCapabilities,
+    SignatureHelp, SignatureHelpOptions, SignatureHelpParams, SignatureInformation,
+    SymbolInformation, SymbolKind as LspSymbolKind, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
     notification::{
         DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
         Notification as NotificationTrait, PublishDiagnostics,
@@ -31,15 +32,15 @@ use lsp_types::{
     request::{
         Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest,
         Formatting, GotoDefinition, HoverRequest, PrepareRenameRequest, References, Rename,
-        Request as RequestTrait, SelectionRangeRequest, WorkspaceConfiguration,
-        WorkspaceSymbolRequest,
+        Request as RequestTrait, SelectionRangeRequest, SignatureHelpRequest,
+        WorkspaceConfiguration, WorkspaceSymbolRequest,
     },
 };
 use serde::Deserialize;
 use wesl_analysis::{
     AnalysisHost, Completion as AnalysisCompletion, CompletionKind, DiagnosticSeverity, FoldKind,
-    FoldingRange as AnalysisFoldingRange, LineIndex, Symbol, SymbolKind,
-    WorkspaceSymbol as AnalysisWorkspaceSymbol,
+    FoldingRange as AnalysisFoldingRange, LineIndex, SignatureHelp as AnalysisSignatureHelp,
+    Symbol, SymbolKind, WorkspaceSymbol as AnalysisWorkspaceSymbol,
 };
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -182,6 +183,11 @@ fn capabilities() -> ServerCapabilities {
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".to_owned()]),
             ..CompletionOptions::default()
+        }),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_owned()]),
+            retrigger_characters: Some(vec![",".to_owned()]),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
         document_formatting_provider: Some(OneOf::Left(true)),
         ..ServerCapabilities::default()
@@ -416,6 +422,16 @@ impl Server<'_> {
                         message.to_owned(),
                     ),
                 }
+            }
+            SignatureHelpRequest::METHOD => {
+                let params: SignatureHelpParams = serde_json::from_value(request.params)?;
+                let path = uri_path(&params.text_document_position_params.text_document.uri)?;
+                let source = self.analysis.source(&path).unwrap_or_default().to_owned();
+                let result =
+                    position_offset(&source, params.text_document_position_params.position)
+                        .and_then(|offset| self.analysis.signature_help(&path, offset))
+                        .map(lsp_signature_help);
+                Response::new_ok(request.id, result)
             }
             SelectionRangeRequest::METHOD => {
                 let params: SelectionRangeParams = serde_json::from_value(request.params)?;
@@ -718,6 +734,46 @@ fn lsp_location(location: wesl_analysis::Location) -> Option<LspLocation> {
         Url::from_file_path(&location.path).ok()?,
         lsp_range_for_file(&location.path, location.range)?,
     ))
+}
+
+/// Parameter labels are sent as offsets into the signature label rather than as substrings,
+/// so a client highlights the right occurrence when two parameters share a spelling.
+fn lsp_signature_help(help: AnalysisSignatureHelp) -> SignatureHelp {
+    SignatureHelp {
+        signatures: help
+            .signatures
+            .into_iter()
+            .map(|signature| SignatureInformation {
+                parameters: Some(
+                    signature
+                        .parameters
+                        .iter()
+                        .map(|span| ParameterInformation {
+                            label: ParameterLabel::LabelOffsets([
+                                utf16_length(&signature.label[..span.start]),
+                                utf16_length(&signature.label[..span.end]),
+                            ]),
+                            documentation: None,
+                        })
+                        .collect(),
+                ),
+                documentation: signature.documentation.map(|value| {
+                    Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    })
+                }),
+                label: signature.label,
+                active_parameter: None,
+            })
+            .collect(),
+        active_signature: Some(help.active_signature as u32),
+        active_parameter: Some(help.active_parameter as u32),
+    }
+}
+
+fn utf16_length(text: &str) -> u32 {
+    text.encode_utf16().count() as u32
 }
 
 /// Folds the innermost-first chain into the protocol's outermost-rooted linked list.

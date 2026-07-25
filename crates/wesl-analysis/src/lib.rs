@@ -7,6 +7,7 @@ mod line_index;
 mod overlay;
 mod root;
 mod selection;
+mod signature;
 mod ty;
 
 pub use analysis::{AnalysisHost, Diagnostic, DiagnosticSeverity};
@@ -21,4 +22,5 @@ pub use line_index::{LineIndex, Position};
 pub use overlay::OverlayResolver;
 pub use root::discover_root;
 pub use selection::selection_ranges;
+pub use signature::{SignatureHelp, SignatureInfo};
 pub use ty::{Ty, TypeDiagnostic, check_module};

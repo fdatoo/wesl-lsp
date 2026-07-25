@@ -9,6 +9,7 @@ use std::{
 use crate::{
     builtins::{BUILTIN_FUNCTIONS, BUILTIN_TYPES, builtin},
     dialect,
+    signature::{SignatureHelp, SignatureInfo, enclosing_call, parameter_spans},
     ty::{Ty, TypeDiagnostic, TypeEnvironment, analyze_module, infer_expression_type},
 };
 use smol_str::SmolStr;
@@ -288,6 +289,59 @@ impl PackageIndex {
             .get(path)
             .map(|file| file.symbols.clone())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn signature_help(&self, path: &Path, offset: usize) -> Option<SignatureHelp> {
+        let file = self.files.get(path)?;
+        let (callee, active_parameter) = enclosing_call(&file.source, offset)?;
+
+        if let Some(symbol) = self.resolve(path, &callee, offset) {
+            let label = match symbol.kind {
+                SymbolKind::Function => symbol.signature.clone(),
+                // Structs are callable as constructors, but their indexed signature stops at
+                // the opening brace, so rebuild a call-shaped label from the members.
+                SymbolKind::Struct => format!(
+                    "{}({})",
+                    symbol.name,
+                    symbol
+                        .children
+                        .iter()
+                        .map(|member| member.signature.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => return None,
+            };
+            return Some(SignatureHelp {
+                signatures: vec![SignatureInfo {
+                    parameters: parameter_spans(&label),
+                    label,
+                    documentation: symbol.documentation.clone(),
+                }],
+                active_signature: 0,
+                active_parameter,
+            });
+        }
+
+        let signatures = builtin(&callee)?
+            .overloads
+            .iter()
+            .map(|overload| SignatureInfo {
+                label: overload.signature.to_owned(),
+                parameters: parameter_spans(overload.signature),
+                documentation: (!overload.doc.is_empty()).then(|| overload.doc.to_owned()),
+            })
+            .collect::<Vec<_>>();
+        // Prefer an overload that actually has the argument the cursor is sitting on.
+        let active_signature = signatures
+            .iter()
+            .position(|signature| signature.parameters.len() > active_parameter)
+            .unwrap_or(0);
+        Some(SignatureHelp {
+            signatures,
+            active_signature,
+            active_parameter,
+        })
     }
 
     pub(crate) fn workspace_symbols(&self, query: &str) -> Vec<WorkspaceSymbol> {
@@ -1384,7 +1438,7 @@ fn is_shader(path: &Path) -> bool {
     )
 }
 
-fn is_identifier(name: &str) -> bool {
+pub(crate) fn is_identifier(name: &str) -> bool {
     let mut bytes = name.bytes();
     bytes
         .next()

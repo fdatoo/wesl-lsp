@@ -907,3 +907,95 @@ fn selection_ranges_nest_outward() {
 
     client.shutdown();
 }
+
+#[test]
+fn signature_help_covers_builtins_user_functions_and_constructors() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = concat!(
+        "struct Camera { origin: vec3<f32>, focal: f32, }\n",
+        "fn shade(albedo: vec3<f32>, roughness: f32) -> f32 { return roughness; }\n",
+        "fn main() {\n",
+        "    let a = clamp(1.0, 0.0, 1.0);\n",
+        "    let b = shade(vec3(1.0), 0.5);\n",
+        "    let c = Camera(vec3(0.0), 1.0);\n",
+        "}\n",
+    );
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["signatureHelpProvider"]["triggerCharacters"],
+        json!(["("])
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    client.receive_diagnostics(&uri);
+
+    let mut signature_at = |id: i64, offset: usize| {
+        client.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/signatureHelp",
+            "params": {
+                "textDocument": {"uri": uri},
+                "position": position(source, offset)
+            }
+        }));
+        client.receive_response(id)
+    };
+
+    // Builtin, cursor on the third argument.
+    let third = source.find("0.0, 1.0)").unwrap() + "0.0, ".len();
+    let builtin = signature_at(2, third);
+    assert_eq!(builtin["result"]["activeParameter"], 2, "{builtin:#?}");
+    let label = builtin["result"]["signatures"]
+        [builtin["result"]["activeSignature"].as_u64().unwrap() as usize]["label"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(label.contains("clamp"), "{builtin:#?}");
+
+    // User function, cursor on the second argument.
+    let roughness = source.find("0.5)").unwrap();
+    let user = signature_at(3, roughness);
+    assert_eq!(user["result"]["activeParameter"], 1, "{user:#?}");
+    assert_eq!(
+        user["result"]["signatures"][0]["label"],
+        "fn shade(albedo: vec3<f32>, roughness: f32) -> f32"
+    );
+    // Parameter labels are offsets into the label, not substrings.
+    let offsets = &user["result"]["signatures"][0]["parameters"][1]["label"];
+    let expected_start = "fn shade(albedo: vec3<f32>, ".len();
+    assert_eq!(offsets[0], expected_start as u64, "{user:#?}");
+
+    // Struct constructor, rebuilt from members.
+    let constructor = source.find("vec3(0.0), 1.0)").unwrap() + "vec3(0.0), ".len();
+    let structure = signature_at(4, constructor);
+    assert_eq!(
+        structure["result"]["signatures"][0]["label"], "Camera(origin: vec3<f32>, focal: f32)",
+        "{structure:#?}"
+    );
+    assert_eq!(structure["result"]["activeParameter"], 1);
+
+    client.shutdown();
+}

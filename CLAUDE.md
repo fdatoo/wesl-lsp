@@ -148,11 +148,12 @@ legitimate reason to refuse.
 
 `capabilities()` in `crates/wesl-lsp/src/main.rs` advertises: full-document sync, definition,
 references, rename (with prepare), document symbols, document highlight, workspace symbols,
-folding ranges, selection ranges, hover, completion (trigger character `.`), and
-whole-document formatting. Diagnostics are pushed, not pulled.
+folding ranges, selection ranges, hover, completion (trigger character `.`), signature help
+(trigger `(`, retrigger `,`), and whole-document formatting. Diagnostics are pushed, not pulled.
 
-`folding.rs` and `selection.rs` work from tokens and delimiter nesting rather than the AST,
-so both survive a buffer that does not parse — which is exactly when the cursor is in one.
+`folding.rs`, `selection.rs` and `signature.rs` work from tokens and delimiter nesting rather
+than the AST, so all three survive a buffer that does not parse — which is exactly the state
+a buffer is in while a call is half-typed.
 Folding returns byte ranges covering the whole construct and the protocol layer decides which
 lines stay visible (a brace region keeps its closing `}`, a comment or import run does not).
 Selection stops at delimiter granularity: expanding inside `a + b * c` jumps from the
@@ -175,8 +176,6 @@ Not yet implemented, ordered roughly by value to shader authors:
 - **Inlay hints** — struct layout hints (alignment and size on members) are the standout here;
   that information is genuinely hard to get anywhere else and matters for uniform buffer
   correctness. Type and parameter hints are the conventional variants.
-- **Signature help** — the builtin overload data in `builtins.rs` already carries the
-  signatures, so this is mostly protocol wiring.
 - **Range formatting** — `wesl-fmt::format` is whole-document by construction; range support
   needs a way to bound the AST print, which is not a small change.
 - **Incremental sync** — currently `FULL`. Only worth doing if large shaders show latency.

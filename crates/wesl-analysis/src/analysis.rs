@@ -8,8 +8,8 @@ use std::{
 use wgsl_parse::{parse_str, syntax::TranslationUnit};
 
 use crate::{
-    Completion, FoldingRange, HoverInfo, Location, OverlayResolver, PackageIndex, SourceEdit,
-    Symbol, WorkspaceSymbol, dialect, discover_root,
+    Completion, FoldingRange, HoverInfo, Location, OverlayResolver, PackageIndex, SignatureHelp,
+    SourceEdit, Symbol, WorkspaceSymbol, dialect, discover_root,
 };
 use wesl::Resolver;
 
@@ -314,6 +314,10 @@ impl AnalysisHost {
 
     pub fn hover(&mut self, path: &Path, offset: usize) -> Option<HoverInfo> {
         self.ensure_package(path).hover(path, offset)
+    }
+
+    pub fn signature_help(&mut self, path: &Path, offset: usize) -> Option<SignatureHelp> {
+        self.ensure_package(path).signature_help(path, offset)
     }
 
     pub fn completions(&mut self, path: &Path, offset: usize) -> Vec<Completion> {
