@@ -149,7 +149,13 @@ legitimate reason to refuse.
 `capabilities()` in `crates/wesl-lsp/src/main.rs` advertises: incremental sync, definition,
 references, rename (with prepare), document symbols, document highlight, workspace symbols,
 folding ranges, selection ranges, hover, completion (trigger character `.`), signature help
-(trigger `(`, retrigger `,`), inlay hints, and whole-document formatting.
+(trigger `(`, retrigger `,`), inlay hints, whole-document formatting, and `willRenameFiles`
+for `.wesl`/`.wgsl`.
+
+`willRenameFiles` rewrites import paths that pointed at the renamed shader. It resolves each
+candidate through `module_file` before touching any text, so a module of the same name in
+another package is never edited, and the path match requires a segment boundary so
+`package::mesh` does not match inside `package::mesh_utils`.
 
 Inlay hints come from three sources. Type hints reuse the type checker:
 `inferred_declarations` runs the same pass as `analyze_module` but keeps the type it settled
@@ -205,7 +211,6 @@ Not yet implemented, ordered roughly by value to shader authors:
 
 - **Range formatting** — `wesl-fmt::format` is whole-document by construction; range support
   needs a way to bound the AST print, which is not a small change.
-- **`willRename` file operations** — rewriting import paths when a shader file is renamed.
 - **Semantic tokens and code actions** — no work started.
 
 Adding a capability means touching four layers in order: `capabilities()`, a `METHOD` arm in

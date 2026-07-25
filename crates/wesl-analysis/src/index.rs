@@ -292,6 +292,55 @@ impl PackageIndex {
         Ok(range)
     }
 
+    /// Edits that keep imports pointing at a shader that is about to be renamed. Called
+    /// before the rename happens, so the index still describes the old layout.
+    pub(crate) fn file_rename_edits(&self, old_path: &Path, new_path: &Path) -> Vec<SourceEdit> {
+        let (Some(old_module), Some(new_module)) = (
+            module_name(&self.root, old_path),
+            module_name(&self.root, new_path),
+        ) else {
+            return Vec::new();
+        };
+        if old_module == new_module {
+            return Vec::new();
+        }
+        let old_text = format!("package::{old_module}");
+        let new_text = format!("package::{new_module}");
+
+        let mut edits = Vec::new();
+        for (path, file) in &self.files {
+            if path == old_path {
+                continue;
+            }
+            // Resolve first: only rewrite text in files that genuinely import this module,
+            // so a same-named module in another package is never touched.
+            let imports_target = file
+                .imports
+                .iter()
+                .map(|binding| &binding.module)
+                .chain(file.imported_modules.iter())
+                .any(|module| self.module_file(module).as_deref() == Some(old_path));
+            if !imports_target {
+                continue;
+            }
+            edits.extend(
+                import_path_ranges(&file.source, &old_text)
+                    .into_iter()
+                    .map(|range| SourceEdit {
+                        path: path.clone(),
+                        range,
+                        new_text: new_text.clone(),
+                    }),
+            );
+        }
+        edits.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.range.start.cmp(&right.range.start))
+        });
+        edits
+    }
+
     pub(crate) fn document_symbols(&self, path: &Path) -> Vec<Symbol> {
         self.files
             .get(path)
@@ -978,6 +1027,42 @@ fn module_name(root: &Path, path: &Path) -> Option<String> {
             .collect::<Vec<_>>()
             .join("::"),
     )
+}
+
+/// Occurrences of a module path inside `import` statements. The match must end on a path
+/// boundary, so `package::mesh` never matches inside `package::mesh_utils`.
+fn import_path_ranges(source: &str, module_path: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut line_start = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let is_import = trimmed
+            .strip_prefix("import")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+        if is_import {
+            let mut search = 0;
+            while let Some(found) = line[search..].find(module_path) {
+                let start = search + found;
+                let end = start + module_path.len();
+                let before_is_path = start
+                    .checked_sub(1)
+                    .and_then(|index| line.as_bytes().get(index))
+                    .is_some_and(|byte| {
+                        byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b':'
+                    });
+                let after_is_identifier = line
+                    .as_bytes()
+                    .get(end)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+                if !before_is_path && !after_is_identifier {
+                    ranges.push(line_start + start..line_start + end);
+                }
+                search = end;
+            }
+        }
+        line_start += line.len();
+    }
+    ranges
 }
 
 fn import_insertion_offset(source: &str) -> usize {

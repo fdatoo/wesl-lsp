@@ -16,20 +16,23 @@ use lsp_types::{
     DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportKind,
     DocumentDiagnosticReportResult, DocumentFormattingParams, DocumentHighlight,
     DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, Documentation, FoldingRange as LspFoldingRange, FoldingRangeKind,
-    FoldingRangeParams, FoldingRangeProviderCapability, FullDocumentDiagnosticReport,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InlayHint as LspInlayHint,
-    InlayHintKind, InlayHintLabel, InlayHintOptions, InlayHintParams, InlayHintServerCapabilities,
-    InsertTextFormat, Location as LspLocation, MarkupContent, MarkupKind, OneOf,
-    ParameterInformation, ParameterLabel, Position as LspPosition, PrepareRenameResponse,
-    PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
-    RelatedFullDocumentDiagnosticReport, RenameOptions, RenameParams, SaveOptions, SelectionRange,
-    SelectionRangeParams, SelectionRangeProviderCapability, ServerCapabilities, SignatureHelp,
-    SignatureHelpOptions, SignatureHelpParams, SignatureInformation, SymbolInformation,
-    SymbolKind as LspSymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
-    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    DocumentSymbolResponse, Documentation, FileOperationFilter, FileOperationPattern,
+    FileOperationPatternKind, FileOperationRegistrationOptions, FoldingRange as LspFoldingRange,
+    FoldingRangeKind, FoldingRangeParams, FoldingRangeProviderCapability,
+    FullDocumentDiagnosticReport, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InlayHint as LspInlayHint, InlayHintKind, InlayHintLabel, InlayHintOptions, InlayHintParams,
+    InlayHintServerCapabilities, InsertTextFormat, Location as LspLocation, MarkupContent,
+    MarkupKind, OneOf, ParameterInformation, ParameterLabel, Position as LspPosition,
+    PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
+    RelatedFullDocumentDiagnosticReport, RenameFilesParams, RenameOptions, RenameParams,
+    SaveOptions, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
+    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    SignatureInformation, SymbolInformation, SymbolKind as LspSymbolKind,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceFileOperationsServerCapabilities, WorkspaceServerCapabilities,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
     notification::{
         DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
         Notification as NotificationTrait, PublishDiagnostics,
@@ -38,7 +41,7 @@ use lsp_types::{
         Completion, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
         FoldingRangeRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
         PrepareRenameRequest, References, Rename, Request as RequestTrait, SelectionRangeRequest,
-        SignatureHelpRequest, WorkspaceConfiguration, WorkspaceSymbolRequest,
+        SignatureHelpRequest, WillRenameFiles, WorkspaceConfiguration, WorkspaceSymbolRequest,
     },
 };
 use serde::Deserialize;
@@ -231,6 +234,22 @@ fn capabilities(pull_diagnostics: bool) -> ServerCapabilities {
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
         document_formatting_provider: Some(OneOf::Left(true)),
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: None,
+            file_operations: Some(WorkspaceFileOperationsServerCapabilities {
+                will_rename: Some(FileOperationRegistrationOptions {
+                    filters: vec![FileOperationFilter {
+                        scheme: Some("file".to_owned()),
+                        pattern: FileOperationPattern {
+                            glob: "**/*.{wesl,wgsl}".to_owned(),
+                            matches: Some(FileOperationPatternKind::File),
+                            options: None,
+                        },
+                    }],
+                }),
+                ..WorkspaceFileOperationsServerCapabilities::default()
+            }),
+        }),
         ..ServerCapabilities::default()
     }
 }
@@ -488,6 +507,37 @@ impl Server<'_> {
                         message.to_owned(),
                     ),
                 }
+            }
+            WillRenameFiles::METHOD => {
+                let params: RenameFilesParams = serde_json::from_value(request.params)?;
+                let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                for rename in &params.files {
+                    let (Some(old_path), Some(new_path)) = (
+                        file_uri_path(&rename.old_uri),
+                        file_uri_path(&rename.new_uri),
+                    ) else {
+                        continue;
+                    };
+                    let old_path = old_path.canonicalize().unwrap_or(old_path);
+                    for edit in self.analysis.file_rename_edits(&old_path, &new_path) {
+                        let Some(range) = lsp_range_for_file(&edit.path, edit.range) else {
+                            continue;
+                        };
+                        let Ok(uri) = Url::from_file_path(&edit.path) else {
+                            continue;
+                        };
+                        changes.entry(uri).or_default().push(TextEdit {
+                            range,
+                            new_text: edit.new_text,
+                        });
+                    }
+                }
+                let result = (!changes.is_empty()).then_some(WorkspaceEdit {
+                    changes: Some(changes),
+                    document_changes: None,
+                    change_annotations: None,
+                });
+                Response::new_ok(request.id, result)
             }
             DocumentDiagnosticRequest::METHOD => {
                 let params: DocumentDiagnosticParams = serde_json::from_value(request.params)?;
@@ -1026,6 +1076,11 @@ fn document_symbol(path: &Path, symbol: Symbol) -> Option<DocumentSymbol> {
         selection_range,
         children: (!children.is_empty()).then_some(children),
     })
+}
+
+/// File-operation params carry URIs as plain strings rather than parsed `Url`s.
+fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    Url::parse(uri).ok()?.to_file_path().ok()
 }
 
 fn uri_path(uri: &Url) -> Result<PathBuf> {

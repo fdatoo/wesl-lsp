@@ -1242,3 +1242,80 @@ fn pull_capable_clients_get_reports_instead_of_pushes() {
     client.input.take();
     assert!(client.child.wait().unwrap().success());
 }
+
+#[test]
+fn renaming_a_shader_returns_import_edits() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let dependency = root.join("mesh.wesl");
+    fs::write(&dependency, "const value = 1;\n").unwrap();
+    let path = root.join("main.wesl");
+    let source = "import package::mesh::value;\nconst total = value;\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["workspace"]["fileOperations"]["willRename"]["filters"]
+            [0]["pattern"]["glob"],
+        "**/*.{wesl,wgsl}",
+        "{initialized:#?}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    client.receive_diagnostics(&uri);
+
+    let renamed = lsp_types::Url::from_file_path(root.join("geometry.wesl")).unwrap();
+    let old_uri = lsp_types::Url::from_file_path(&dependency).unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "workspace/willRenameFiles",
+        "params": {
+            "files": [{"oldUri": old_uri, "newUri": renamed}]
+        }
+    }));
+    let edits = client.receive_response(2);
+    let changes = &edits["result"]["changes"][uri.as_str()];
+    assert_eq!(changes[0]["newText"], "package::geometry", "{edits:#?}");
+    assert_eq!(changes[0]["range"]["start"], position(source, 7));
+    assert_eq!(
+        changes[0]["range"]["end"],
+        position(source, 7 + "package::mesh".len())
+    );
+
+    // Renaming a file nobody imports yields no edit at all.
+    let unrelated = lsp_types::Url::from_file_path(root.join("main.wesl")).unwrap();
+    let unrelated_target = lsp_types::Url::from_file_path(root.join("entry.wesl")).unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "workspace/willRenameFiles",
+        "params": {
+            "files": [{"oldUri": unrelated, "newUri": unrelated_target}]
+        }
+    }));
+    assert!(
+        client.receive_response(3)["result"].is_null(),
+        "no importers means no edit"
+    );
+
+    client.shutdown();
+}

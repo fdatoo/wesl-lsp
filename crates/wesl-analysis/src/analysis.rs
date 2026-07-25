@@ -312,6 +312,13 @@ impl AnalysisHost {
         self.ensure_package(path).document_symbols(path)
     }
 
+    /// Import rewrites for a shader that is about to be renamed. Resolved against the old
+    /// path, so this must be called before the file moves.
+    pub fn file_rename_edits(&mut self, old_path: &Path, new_path: &Path) -> Vec<SourceEdit> {
+        self.ensure_package(old_path)
+            .file_rename_edits(old_path, new_path)
+    }
+
     pub fn hover(&mut self, path: &Path, offset: usize) -> Option<HoverInfo> {
         self.ensure_package(path).hover(path, offset)
     }
@@ -511,6 +518,51 @@ mod tests {
             host.rename(&path, offset, "renamed"),
             Err("cannot rename a WGSL builtin")
         );
+    }
+
+    #[test]
+    fn renaming_a_shader_rewrites_importing_files() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let dependency = root.join("mesh.wesl");
+        fs::write(&dependency, "const value = 1;\n").unwrap();
+        // A same-prefixed neighbour that must not be rewritten.
+        let neighbour = root.join("mesh_utils.wesl");
+        fs::write(&neighbour, "const helper = 2;\n").unwrap();
+        let importer = root.join("main.wesl");
+        let source = concat!(
+            "import package::mesh::value;\n",
+            "import package::mesh_utils::helper;\n",
+            "const total = value + helper;\n",
+        );
+        fs::write(&importer, source).unwrap();
+
+        let mut host = AnalysisHost::new(Some(root.clone()));
+        host.open(importer.clone(), source.into());
+
+        let edits = host.file_rename_edits(&dependency, &root.join("geometry.wesl"));
+        assert_eq!(edits.len(), 1, "{edits:#?}");
+        assert_eq!(edits[0].path, importer);
+        assert_eq!(&source[edits[0].range.clone()], "package::mesh");
+        assert_eq!(edits[0].new_text, "package::geometry");
+
+        // Applying the edit leaves the neighbour import untouched.
+        let mut rewritten = source.to_owned();
+        rewritten.replace_range(edits[0].range.clone(), &edits[0].new_text);
+        assert!(rewritten.contains("import package::geometry::value;"));
+        assert!(rewritten.contains("import package::mesh_utils::helper;"));
+
+        // The boundary holds in the other direction too: renaming the longer-named neighbour
+        // rewrites only its own import.
+        let neighbour_edits = host.file_rename_edits(&neighbour, &root.join("helpers.wesl"));
+        assert_eq!(neighbour_edits.len(), 1, "{neighbour_edits:#?}");
+        assert_eq!(
+            &source[neighbour_edits[0].range.clone()],
+            "package::mesh_utils"
+        );
+
+        // A rename that does not change the module path is a no-op.
+        assert!(host.file_rename_edits(&dependency, &dependency).is_empty());
     }
 
     #[test]
