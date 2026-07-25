@@ -97,8 +97,8 @@ downstream type errors. A new diagnostic kind needs a considered position in thi
 append.
 
 `diagnostic_batch` walks the import closure so a fix in a dependency clears stale squiggles in
-its dependents. Diagnostics are **pushed** (`textDocument/publishDiagnostics`) rather than pulled,
-for Zed compatibility, on a 150 ms debounce after `didChange`.
+its dependents. It feeds both delivery mechanisms — see the capability surface below — and the
+push path debounces 150 ms after `didChange`.
 
 ### OverlayResolver (`overlay.rs`)
 
