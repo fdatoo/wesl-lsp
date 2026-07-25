@@ -291,6 +291,16 @@ language server that lights up correct code.
   text. Span drift is what turns a correct diagnostic into a squiggle under the wrong token.
 - `lsp_smoke.rs` spawns the real binary and speaks JSON-RPC over stdio — the only test that
   covers protocol wiring.
+- `editor_services_corpus.rs` runs every offset-based service — hover, completion, definition,
+  signature help, highlights, prepare-rename, selection, folding, inlay hints — over the corpus,
+  asserting no panics and no structurally invalid results. The other corpus tests only touch
+  `check_module`, `AnalysisHost::diagnostics` and `wesl_fmt::format`, so without this everything
+  an editor calls while the cursor moves was covered only by hand-written snippets. **A panic in
+  any handler kills the server**, so real shaders are the input that matters.
+
+  It samples: `MAX_PROBES_PER_FILE` caps offsets per shader, because the corpus contains a
+  1.5 MB generated file and probing every identifier in it alone runs for minutes. If you widen
+  the sample, time it before committing.
 
 ## Conventions
 

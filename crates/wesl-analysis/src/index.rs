@@ -264,12 +264,41 @@ impl PackageIndex {
             .collect())
     }
 
+    /// Occurrences within this file only.
+    ///
+    /// Deliberately not `references(..).filter(same file)`: editors ask for highlights on
+    /// every cursor movement, and `references` scans every file in the package, so filtering
+    /// afterwards would throw away a whole-workspace walk on each keystroke.
     pub(crate) fn document_highlights(&self, path: &Path, offset: usize) -> Vec<Range<usize>> {
-        self.references(path, offset, true)
-            .into_iter()
-            .filter(|location| location.path == path)
-            .map(|location| location.range)
-            .collect()
+        let Some(file) = self.files.get(path) else {
+            return Vec::new();
+        };
+        let Some(name) = identifier_at(&file.source, offset) else {
+            return Vec::new();
+        };
+        let Some(target) = self.resolve(path, &name, offset) else {
+            return Vec::new();
+        };
+        let target_key = (target.path.clone(), target.range.clone());
+
+        let mut ranges = Vec::new();
+        if target.path == path {
+            ranges.push(target.range.clone());
+        }
+        for range in identifier_ranges(&file.source, &name) {
+            if target.path == path && range == target.range {
+                continue;
+            }
+            if self
+                .resolve(path, &name, range.start)
+                .is_some_and(|symbol| (symbol.path, symbol.range) == target_key)
+            {
+                ranges.push(range);
+            }
+        }
+        ranges.sort_by_key(|range| range.start);
+        ranges.dedup();
+        ranges
     }
 
     /// Validates that `offset` sits on something renameable and returns the range the
