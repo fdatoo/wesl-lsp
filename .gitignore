@@ -1,2 +1,6 @@
 /target
 /corpus
+
+# Recorded LSP sessions contain local paths and shader source.
+/traces
+*.jsonl

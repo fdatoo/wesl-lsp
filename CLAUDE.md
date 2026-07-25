@@ -45,7 +45,13 @@ The guard assertions (`compared >= 100`, `formatted_count >= 100`, "oracle did n
 error paths") exist precisely to catch a corpus that fetched but came up empty. Don't weaken them.
 
 ```sh
-WESL_LSP_PRIVATE_CORPUS=/path/to/shaders cargo test --workspace
+WESL_LSP_PRIVATE_CORPUS=/path/to/shaders WESL_LSP_TRACES=/path/to/traces cargo test --workspace
+```
+
+Recording a session to feed that last one:
+
+```sh
+WESL_LSP_TRACE=~/wesl-traces/session.jsonl wesl-lsp-record   # point the editor at this
 ```
 
 ## Architecture
@@ -336,6 +342,16 @@ language server that lights up correct code.
   It samples: `MAX_PROBES_PER_FILE` caps offsets per shader, because the corpus contains a
   1.5 MB generated file and probing every identifier in it alone runs for minutes. If you widen
   the sample, time it before committing.
+- `wesl-lsp-record` is a transparent proxy: point an editor at it instead of the server and it
+  relays both directions while appending every message to `$WESL_LSP_TRACE`. `trace_replay.rs`
+  then drives a fresh server from those recordings. This is how time spent using the editor
+  turns into permanent coverage — a trace is a conversation a real client actually had, so it
+  exercises orderings and request shapes nobody thought to script.
+
+  It asserts **survival and completeness, not identical output**: traces carry the recorder's
+  absolute paths, so results legitimately differ elsewhere. Every request must get a response
+  and the server must exit cleanly. Like the private corpus, it **skips silently** unless
+  `WESL_LSP_TRACES` points at a directory of `.jsonl` traces.
 - The `tests` module in `crates/wesl-lsp/src/main.rs` property-tests `apply_content_changes`
   over hundreds of pseudo-random edit batches in both position encodings. Incremental sync is
   the server's most dangerous silent-failure mode: a misapplied range desynchronises the
