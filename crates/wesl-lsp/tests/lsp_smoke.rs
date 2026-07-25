@@ -745,3 +745,90 @@ fn workspace_symbols_reach_unopened_files() {
 
     client.shutdown();
 }
+
+#[test]
+fn folding_ranges_survive_a_broken_buffer() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source =
+        "// a comment\n// spanning lines\nfn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["foldingRangeProvider"],
+        json!(true)
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    client.receive_diagnostics(&uri);
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/foldingRange",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let folds = client.receive_response(2);
+    let ranges = folds["result"].as_array().unwrap();
+    assert!(
+        ranges.iter().any(|range| range["kind"] == "comment"
+            && range["startLine"] == 0
+            && range["endLine"] == 1),
+        "{folds:#?}"
+    );
+    // The body opens on line 2 and closes on line 5; the `}` stays visible.
+    assert!(
+        ranges.iter().any(|range| range["kind"] == "region"
+            && range["startLine"] == 2
+            && range["endLine"] == 4),
+        "{folds:#?}"
+    );
+
+    // Folding is token-based, so it must keep working once the buffer stops parsing.
+    let broken = source.replace("fn main() {", "fn main( {");
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": uri, "version": 2},
+            "contentChanges": [{"text": broken}]
+        }
+    }));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/foldingRange",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let broken_folds = client.receive_response(3);
+    assert!(
+        broken_folds["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|range| range["kind"] == "region"),
+        "{broken_folds:#?}"
+    );
+
+    client.shutdown();
+}

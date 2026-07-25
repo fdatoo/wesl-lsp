@@ -1022,7 +1022,7 @@ fn binding(base: &ModulePath, prefix: &[String], item: &ImportItem) -> ImportBin
     }
 }
 
-fn brace_scopes(source: &str) -> Vec<Range<usize>> {
+pub(crate) fn brace_scopes(source: &str) -> Vec<Range<usize>> {
     let mut stack = Vec::new();
     let mut scopes = Vec::new();
     for (token, range) in tokens(source) {

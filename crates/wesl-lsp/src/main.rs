@@ -14,11 +14,12 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind,
     DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InsertTextFormat,
-    Location as LspLocation, MarkupContent, MarkupKind, OneOf, Position as LspPosition,
-    PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
-    RenameOptions, RenameParams, ServerCapabilities, SymbolInformation,
+    FoldingRange as LspFoldingRange, FoldingRangeKind, FoldingRangeParams,
+    FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InsertTextFormat, Location as LspLocation, MarkupContent, MarkupKind, OneOf,
+    Position as LspPosition, PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange,
+    ReferenceParams, RenameOptions, RenameParams, ServerCapabilities, SymbolInformation,
     SymbolKind as LspSymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit,
     WorkspaceSymbolParams, WorkspaceSymbolResponse,
@@ -27,15 +28,16 @@ use lsp_types::{
         Notification as NotificationTrait, PublishDiagnostics,
     },
     request::{
-        Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
-        HoverRequest, PrepareRenameRequest, References, Rename, Request as RequestTrait,
-        WorkspaceConfiguration, WorkspaceSymbolRequest,
+        Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest,
+        Formatting, GotoDefinition, HoverRequest, PrepareRenameRequest, References, Rename,
+        Request as RequestTrait, WorkspaceConfiguration, WorkspaceSymbolRequest,
     },
 };
 use serde::Deserialize;
 use wesl_analysis::{
-    AnalysisHost, Completion as AnalysisCompletion, CompletionKind, DiagnosticSeverity, LineIndex,
-    Symbol, SymbolKind, WorkspaceSymbol as AnalysisWorkspaceSymbol,
+    AnalysisHost, Completion as AnalysisCompletion, CompletionKind, DiagnosticSeverity, FoldKind,
+    FoldingRange as AnalysisFoldingRange, LineIndex, Symbol, SymbolKind,
+    WorkspaceSymbol as AnalysisWorkspaceSymbol,
 };
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -172,6 +174,7 @@ fn capabilities() -> ServerCapabilities {
         document_symbol_provider: Some(OneOf::Left(true)),
         document_highlight_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
+        folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".to_owned()]),
@@ -410,6 +413,19 @@ impl Server<'_> {
                         message.to_owned(),
                     ),
                 }
+            }
+            FoldingRangeRequest::METHOD => {
+                let params: FoldingRangeParams = serde_json::from_value(request.params)?;
+                let path = uri_path(&params.text_document.uri)?;
+                let source = self.analysis.source(&path).unwrap_or_default().to_owned();
+                let lines = LineIndex::new(&source);
+                let result = self
+                    .analysis
+                    .folding_ranges(&path)
+                    .into_iter()
+                    .filter_map(|folding| lsp_folding_range(&source, &lines, folding))
+                    .collect::<Vec<_>>();
+                Response::new_ok(request.id, result)
             }
             WorkspaceSymbolRequest::METHOD => {
                 let params: WorkspaceSymbolParams = serde_json::from_value(request.params)?;
@@ -679,6 +695,32 @@ fn lsp_location(location: wesl_analysis::Location) -> Option<LspLocation> {
         Url::from_file_path(&location.path).ok()?,
         lsp_range_for_file(&location.path, location.range)?,
     ))
+}
+
+/// Brace regions keep their closing line visible, because collapsing a function should still
+/// show the `}` that ends it. Comment and import runs have no such delimiter, so the whole run
+/// collapses.
+fn lsp_folding_range(
+    source: &str,
+    lines: &LineIndex,
+    folding: AnalysisFoldingRange,
+) -> Option<LspFoldingRange> {
+    let start = lines.offset_to_position(source, folding.range.start)?;
+    let end = lines.offset_to_position(source, folding.range.end)?;
+    let end_line = match folding.kind {
+        FoldKind::Region => end.line.checked_sub(1)?,
+        FoldKind::Comment | FoldKind::Imports => end.line,
+    };
+    (end_line > start.line).then(|| LspFoldingRange {
+        start_line: start.line,
+        end_line,
+        kind: Some(match folding.kind {
+            FoldKind::Region => FoldingRangeKind::Region,
+            FoldKind::Comment => FoldingRangeKind::Comment,
+            FoldKind::Imports => FoldingRangeKind::Imports,
+        }),
+        ..LspFoldingRange::default()
+    })
 }
 
 /// `SymbolInformation` is deprecated in favour of the 3.17 nested `WorkspaceSymbol`, but it

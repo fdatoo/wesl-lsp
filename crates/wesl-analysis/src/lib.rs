@@ -1,6 +1,7 @@
 mod analysis;
 mod builtins;
 mod dialect;
+mod folding;
 mod index;
 mod line_index;
 mod overlay;
@@ -9,6 +10,7 @@ mod ty;
 
 pub use analysis::{AnalysisHost, Diagnostic, DiagnosticSeverity};
 pub use builtins::{BUILTIN_FUNCTIONS, BUILTIN_TYPES, BuiltinFn, BuiltinOverload, builtin};
+pub use folding::{FoldKind, FoldingRange, folding_ranges};
 pub(crate) use index::PackageIndex;
 pub use index::{
     Completion, CompletionKind, HoverInfo, Location, SourceEdit, Symbol, SymbolKind,

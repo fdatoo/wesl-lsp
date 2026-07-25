@@ -8,8 +8,8 @@ use std::{
 use wgsl_parse::{parse_str, syntax::TranslationUnit};
 
 use crate::{
-    Completion, HoverInfo, Location, OverlayResolver, PackageIndex, SourceEdit, Symbol,
-    WorkspaceSymbol, dialect, discover_root,
+    Completion, FoldingRange, HoverInfo, Location, OverlayResolver, PackageIndex, SourceEdit,
+    Symbol, WorkspaceSymbol, dialect, discover_root,
 };
 use wesl::Resolver;
 
@@ -280,6 +280,13 @@ impl AnalysisHost {
         });
         symbols.dedup();
         symbols
+    }
+
+    /// Purely syntactic, so it works on buffers that do not parse.
+    pub fn folding_ranges(&self, path: &Path) -> Vec<FoldingRange> {
+        self.source(path)
+            .map(crate::folding_ranges)
+            .unwrap_or_default()
     }
 
     pub fn document_highlights(&mut self, path: &Path, offset: usize) -> Vec<Range<usize>> {

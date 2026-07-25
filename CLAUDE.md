@@ -148,8 +148,13 @@ legitimate reason to refuse.
 
 `capabilities()` in `crates/wesl-lsp/src/main.rs` advertises: full-document sync, definition,
 references, rename (with prepare), document symbols, document highlight, workspace symbols,
-hover, completion (trigger character `.`), and whole-document formatting. Diagnostics are
-pushed, not pulled.
+folding ranges, hover, completion (trigger character `.`), and whole-document formatting.
+Diagnostics are pushed, not pulled.
+
+`folding.rs` works from tokens and lines rather than the AST, so folding survives a buffer
+that does not parse. It returns byte ranges covering the whole construct; the protocol layer
+decides which lines stay visible (a brace region keeps its closing `}`, a comment or import
+run does not).
 
 `workspace/symbol` searches the packages owning currently open documents, indexing each open
 buffer's root on demand. Files that were never opened are still found, because `PackageIndex`
@@ -170,7 +175,7 @@ Not yet implemented, ordered roughly by value to shader authors:
   correctness. Type and parameter hints are the conventional variants.
 - **Signature help** — the builtin overload data in `builtins.rs` already carries the
   signatures, so this is mostly protocol wiring.
-- **Folding and selection ranges** — cheap, purely syntactic.
+- **Selection ranges** — needs an AST ancestry walk from the cursor outward.
 - **Range formatting** — `wesl-fmt::format` is whole-document by construction; range support
   needs a way to bound the AST print, which is not a small change.
 - **Incremental sync** — currently `FULL`. Only worth doing if large shaders show latency.
