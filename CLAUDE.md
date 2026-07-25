@@ -149,8 +149,7 @@ legitimate reason to refuse.
 `capabilities()` in `crates/wesl-lsp/src/main.rs` advertises: incremental sync, definition,
 references, rename (with prepare), document symbols, document highlight, workspace symbols,
 folding ranges, selection ranges, hover, completion (trigger character `.`), signature help
-(trigger `(`, retrigger `,`), inlay hints, and whole-document formatting. Diagnostics are
-pushed, not pulled.
+(trigger `(`, retrigger `,`), inlay hints, and whole-document formatting.
 
 Inlay hints come from three sources. Type hints reuse the type checker:
 `inferred_declarations` runs the same pass as `analyze_module` but keeps the type it settled
@@ -189,10 +188,15 @@ text as it stands just before that change. `save` is registered with `includeTex
 is an authoritative full resync — that is what bounds the damage if a change ever fails to
 apply, and why the failure path logs and continues rather than trying to guess.
 
+Diagnostics use **exactly one mechanism per session**, negotiated at initialize. A client that
+declares pull support gets `textDocument/diagnostic` and no pushes; everyone else keeps the
+push path, which is what Zed needs. Advertising both would double-report in clients that do
+both, and the specification advises against mixing them. The pull report carries the rest of
+the import closure in `relatedDocuments`, preserving the push path's behaviour of clearing
+stale squiggles in dependents.
+
 Deliberately absent, with the reasoning:
 
-- **Pull diagnostics** (`textDocument/diagnostic`) — pushing is intentional, for Zed
-  compatibility. See the diagnostic cascade above.
 - **Position encoding negotiation** — UTF-16 is assumed and correct; `line_index.rs` converts
   properly and has a test covering astral-plane characters. Negotiating UTF-8 would save
   conversion work, but nothing is broken today.

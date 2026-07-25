@@ -1175,3 +1175,70 @@ fn incremental_changes_are_applied_in_order() {
 
     client.shutdown();
 }
+
+#[test]
+fn pull_capable_clients_get_reports_instead_of_pushes() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let dependency = root.join("dependency.wesl");
+    fs::write(&dependency, "fn broken() { let value: bool = 1.0; }\n").unwrap();
+    let path = root.join("main.wesl");
+    let source = "import package::dependency::broken;\nfn main() { broken(); }\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    // Declaring pull support flips the server off the push path.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {"textDocument": {"diagnostic": {"dynamicRegistration": false}}},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["diagnosticProvider"]["interFileDependencies"], true,
+        "{initialized:#?}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let report = client.receive_response(2);
+    assert_eq!(report["result"]["kind"], "full", "{report:#?}");
+    assert_eq!(report["result"]["items"], json!([]), "{report:#?}");
+
+    // The failing dependency rides along in relatedDocuments.
+    let dependency_uri = lsp_types::Url::from_file_path(&dependency).unwrap();
+    let related = &report["result"]["relatedDocuments"][dependency_uri.as_str()];
+    assert_eq!(
+        related["items"][0]["message"], "type mismatch: expected bool, found f32",
+        "{report:#?}"
+    );
+
+    // Nothing should have been pushed: the only traffic was our own response.
+    client.send(json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}));
+    let next = client.receive();
+    assert_eq!(
+        next["id"], 3,
+        "a pull-capable client must not receive publishDiagnostics: {next:#?}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "exit"}));
+    client.input.take();
+    assert!(client.child.wait().unwrap().success());
+}

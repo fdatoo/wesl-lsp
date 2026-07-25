@@ -9,33 +9,36 @@ use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    ConfigurationItem, ConfigurationParams, Diagnostic as LspDiagnostic,
-    DiagnosticRelatedInformation, DiagnosticSeverity as LspDiagnosticSeverity,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind,
-    DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-    Documentation, FoldingRange as LspFoldingRange, FoldingRangeKind, FoldingRangeParams,
-    FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InlayHint as LspInlayHint, InlayHintKind, InlayHintLabel, InlayHintOptions, InlayHintParams,
-    InlayHintServerCapabilities, InsertTextFormat, Location as LspLocation, MarkupContent,
-    MarkupKind, OneOf, ParameterInformation, ParameterLabel, Position as LspPosition,
-    PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
-    RenameOptions, RenameParams, SaveOptions, SelectionRange, SelectionRangeParams,
-    SelectionRangeProviderCapability, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
-    SignatureHelpParams, SignatureInformation, SymbolInformation, SymbolKind as LspSymbolKind,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkDoneProgressOptions,
-    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    ConfigurationItem, ConfigurationParams, Diagnostic as LspDiagnostic, DiagnosticOptions,
+    DiagnosticRelatedInformation, DiagnosticServerCapabilities,
+    DiagnosticSeverity as LspDiagnosticSeverity, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportKind,
+    DocumentDiagnosticReportResult, DocumentFormattingParams, DocumentHighlight,
+    DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, Documentation, FoldingRange as LspFoldingRange, FoldingRangeKind,
+    FoldingRangeParams, FoldingRangeProviderCapability, FullDocumentDiagnosticReport,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InlayHint as LspInlayHint,
+    InlayHintKind, InlayHintLabel, InlayHintOptions, InlayHintParams, InlayHintServerCapabilities,
+    InsertTextFormat, Location as LspLocation, MarkupContent, MarkupKind, OneOf,
+    ParameterInformation, ParameterLabel, Position as LspPosition, PrepareRenameResponse,
+    PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
+    RelatedFullDocumentDiagnosticReport, RenameOptions, RenameParams, SaveOptions, SelectionRange,
+    SelectionRangeParams, SelectionRangeProviderCapability, ServerCapabilities, SignatureHelp,
+    SignatureHelpOptions, SignatureHelpParams, SignatureInformation, SymbolInformation,
+    SymbolKind as LspSymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
+    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
     notification::{
         DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
         Notification as NotificationTrait, PublishDiagnostics,
     },
     request::{
-        Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest,
-        Formatting, GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest,
-        References, Rename, Request as RequestTrait, SelectionRangeRequest, SignatureHelpRequest,
-        WorkspaceConfiguration, WorkspaceSymbolRequest,
+        Completion, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
+        FoldingRangeRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
+        PrepareRenameRequest, References, Rename, Request as RequestTrait, SelectionRangeRequest,
+        SignatureHelpRequest, WorkspaceConfiguration, WorkspaceSymbolRequest,
     },
 };
 use serde::Deserialize;
@@ -81,8 +84,14 @@ fn main() -> Result<()> {
     options.root = options
         .root
         .map(|root| resolve_workspace_root(root, configuration_scope.as_ref()));
+    let pull_diagnostics = initialize_params
+        .capabilities
+        .text_document
+        .as_ref()
+        .and_then(|text_document| text_document.diagnostic.as_ref())
+        .is_some();
     let result = InitializeResult {
-        capabilities: capabilities(),
+        capabilities: capabilities(pull_diagnostics),
         server_info: Some(lsp_types::ServerInfo {
             name: "wesl-lsp".into(),
             version: Some(env!("CARGO_PKG_VERSION").into()),
@@ -103,6 +112,7 @@ fn main() -> Result<()> {
         pending: HashMap::new(),
         startup_messages,
         log_timing,
+        push_diagnostics: !pull_diagnostics,
     };
     server.run()?;
     drop(server);
@@ -168,8 +178,22 @@ fn resolve_workspace_root(root: PathBuf, scope_uri: Option<&Url>) -> PathBuf {
         .unwrap_or(root)
 }
 
-fn capabilities() -> ServerCapabilities {
+/// Diagnostics are delivered by exactly one mechanism per session. Clients that declare pull
+/// support get `textDocument/diagnostic` and no pushes; everyone else — Zed among them — keeps
+/// the push path. Advertising both would leave clients that do both double-reporting, and the
+/// specification advises against mixing them.
+fn capabilities(pull_diagnostics: bool) -> ServerCapabilities {
     ServerCapabilities {
+        diagnostic_provider: pull_diagnostics.then(|| {
+            DiagnosticServerCapabilities::Options(DiagnosticOptions {
+                identifier: Some("wesl-lsp".to_owned()),
+                // A shader's diagnostics depend on the files it imports, so a change elsewhere
+                // in the package can change this document's result.
+                inter_file_dependencies: true,
+                workspace_diagnostics: false,
+                work_done_progress_options: WorkDoneProgressOptions::default(),
+            })
+        }),
         // `include_text` on save is deliberate: it gives an authoritative full resync on every
         // save, which bounds how long an incremental change we failed to apply can persist.
         text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -218,6 +242,8 @@ struct Server<'a> {
     pending: HashMap<PathBuf, Instant>,
     startup_messages: VecDeque<Message>,
     log_timing: bool,
+    /// False when the client pulls instead; see [`capabilities`].
+    push_diagnostics: bool,
 }
 
 impl Server<'_> {
@@ -463,6 +489,42 @@ impl Server<'_> {
                     ),
                 }
             }
+            DocumentDiagnosticRequest::METHOD => {
+                let params: DocumentDiagnosticParams = serde_json::from_value(request.params)?;
+                let path = uri_path(&params.text_document.uri)?;
+                let mut batch = self.analysis.diagnostic_batch(&path);
+                let items = batch
+                    .iter()
+                    .position(|(reported, _)| *reported == path)
+                    .map(|index| batch.remove(index).1)
+                    .unwrap_or_default();
+                // The rest of the import closure rides along, so fixing a dependency clears
+                // the stale squiggles in its dependents without waiting for them to be pulled.
+                let related_documents = batch
+                    .into_iter()
+                    .filter_map(|(other, diagnostics)| {
+                        let items = self.lsp_diagnostics(&other, diagnostics);
+                        Some((
+                            Url::from_file_path(other).ok()?,
+                            DocumentDiagnosticReportKind::Full(FullDocumentDiagnosticReport {
+                                result_id: None,
+                                items,
+                            }),
+                        ))
+                    })
+                    .collect::<HashMap<_, _>>();
+                let report = RelatedFullDocumentDiagnosticReport {
+                    related_documents: (!related_documents.is_empty()).then_some(related_documents),
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: self.lsp_diagnostics(&path, items),
+                    },
+                };
+                Response::new_ok(
+                    request.id,
+                    DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(report)),
+                )
+            }
             InlayHintRequest::METHOD => {
                 let params: InlayHintParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document.uri)?;
@@ -620,6 +682,9 @@ impl Server<'_> {
     }
 
     fn publish(&mut self, path: &Path) -> Result<()> {
+        if !self.push_diagnostics {
+            return Ok(());
+        }
         let started = Instant::now();
         let batch = self.analysis.diagnostic_batch(path);
         for (diagnostic_path, diagnostics) in batch {
@@ -640,6 +705,25 @@ impl Server<'_> {
         path: &Path,
         diagnostics: Vec<wesl_analysis::Diagnostic>,
     ) -> Result<()> {
+        let params = PublishDiagnosticsParams::new(
+            Url::from_file_path(path).map_err(|_| anyhow::anyhow!("invalid file path"))?,
+            self.lsp_diagnostics(path, diagnostics),
+            self.versions.get(path).copied(),
+        );
+        self.connection
+            .sender
+            .send(Message::Notification(Notification::new(
+                PublishDiagnostics::METHOD.into(),
+                params,
+            )))?;
+        Ok(())
+    }
+
+    fn lsp_diagnostics(
+        &self,
+        path: &Path,
+        diagnostics: Vec<wesl_analysis::Diagnostic>,
+    ) -> Vec<LspDiagnostic> {
         let source = self
             .analysis
             .source(path)
@@ -647,7 +731,7 @@ impl Server<'_> {
             .or_else(|| std::fs::read_to_string(path).ok().map(Cow::Owned))
             .unwrap_or_default();
         let lines = LineIndex::new(&source);
-        let diagnostics = diagnostics
+        diagnostics
             .into_iter()
             .map(|diagnostic| {
                 let start = lines
@@ -700,19 +784,7 @@ impl Server<'_> {
                     ..LspDiagnostic::default()
                 }
             })
-            .collect();
-        let params = PublishDiagnosticsParams::new(
-            Url::from_file_path(path).map_err(|_| anyhow::anyhow!("invalid file path"))?,
-            diagnostics,
-            self.versions.get(path).copied(),
-        );
-        self.connection
-            .sender
-            .send(Message::Notification(Notification::new(
-                PublishDiagnostics::METHOD.into(),
-                params,
-            )))?;
-        Ok(())
+            .collect()
     }
 }
 
