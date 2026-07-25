@@ -44,6 +44,11 @@ you have confirmed the corpus is present.
 The guard assertions (`compared >= 100`, `formatted_count >= 100`, "oracle did not exercise both
 error paths") exist precisely to catch a corpus that fetched but came up empty. Don't weaken them.
 
+`WESL_LSP_REQUIRE_CORPORA=1` turns a missing public corpus from a skip into a failure, and CI
+sets it. Without it a half-successful `fetch-corpus` leaves the whole suite green in
+milliseconds. The private corpus and traces stay opt-in because CI has neither — set them
+locally, and prefer the full command below over a bare `cargo test`.
+
 ```sh
 WESL_LSP_PRIVATE_CORPUS=/path/to/shaders WESL_LSP_TRACES=/path/to/traces cargo test --workspace
 ```
@@ -332,6 +337,15 @@ language server that lights up correct code.
   default, and honouring that silently moved every Zed user onto a path that had already been
   backed out. If a client changes what it sends, refresh the fixture deliberately and read what
   the assertions do.
+- `mutation_fuzz.rs` runs the same services over *deliberately damaged* shaders — truncated
+  mid-token, unbalanced delimiters, junk spliced into identifiers, spans duplicated. The corpus
+  as written is valid, but a buffer is broken for most of the time anyone is typing in it, which
+  is exactly when completion and signature help get called. Mutations are seeded, so a failure
+  names a reproducing shader and seed.
+
+  **Validated by fault injection**, like the sync property test: an off-by-one in `folding.rs`
+  (including the line terminator in a run's end offset) was caught immediately as an
+  out-of-bounds slice. Re-check that if you rework the mutators.
 - `editor_services_corpus.rs` runs every offset-based service — hover, completion, definition,
   signature help, highlights, prepare-rename, selection, folding, inlay hints — over the corpus,
   asserting no panics and no structurally invalid results. The other corpus tests only touch

@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+env:
+  # Every corpus gate returns early when its input is missing, so a half-successful fetch would
+  # turn the suite green while proving nothing. This makes that silence a failure instead.
+  WESL_LSP_REQUIRE_CORPORA: "1"
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -20,6 +25,27 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
       - name: Test private-corpus gate in skip mode
+        # The private shaders are not available here; this proves the gate skips cleanly rather
+        # than erroring. Run it locally with WESL_LSP_PRIVATE_CORPUS set for the real coverage.
+        env:
+          WESL_LSP_REQUIRE_CORPORA: ""
         run: cargo test -p wesl-analysis --test private_corpus --locked
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  coverage:
+    runs-on: ubuntu-latest
+    # Informational: it answers "what is untested?" rather than gating merges, because a
+    # coverage threshold would reward tests that execute code without asserting anything.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch pinned shader corpora
+        run: cargo run -p xtask -- fetch-corpus
+      - name: Measure coverage
+        run: cargo llvm-cov --workspace --locked --summary-only

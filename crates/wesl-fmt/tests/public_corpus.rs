@@ -2,11 +2,25 @@ use std::{fs, path::PathBuf};
 
 use walkdir::WalkDir;
 
+/// With `WESL_LSP_REQUIRE_CORPORA` set, a missing corpus fails instead of skipping.
+///
+/// Every corpus gate returns early when its input is absent, which means a half-successful
+/// `fetch-corpus` turns the whole suite green while proving nothing. CI sets this so that
+/// silence becomes a failure.
+fn require_corpora() -> bool {
+    std::env::var_os("WESL_LSP_REQUIRE_CORPORA").is_some()
+}
+
 #[test]
 fn public_corpus_formatting_is_idempotent() {
     let _ = env_logger::builder().is_test(true).try_init();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
     if !root.exists() {
+        assert!(
+            !require_corpora(),
+            "corpus missing at {}; run `cargo run -p xtask -- fetch-corpus`",
+            root.display()
+        );
         return;
     }
     let mut formatted_count = 0;
