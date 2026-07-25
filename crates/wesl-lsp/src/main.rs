@@ -12,20 +12,23 @@ use lsp_types::{
     ConfigurationItem, ConfigurationParams, Diagnostic as LspDiagnostic,
     DiagnosticRelatedInformation, DiagnosticSeverity as LspDiagnosticSeverity,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InsertTextFormat,
+    DidSaveTextDocumentParams, DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind,
+    DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InsertTextFormat,
     Location as LspLocation, MarkupContent, MarkupKind, OneOf, Position as LspPosition,
-    PublishDiagnosticsParams, Range as LspRange, ReferenceParams, RenameOptions, RenameParams,
-    ServerCapabilities, SymbolKind as LspSymbolKind, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit,
+    PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
+    RenameOptions, RenameParams, ServerCapabilities, SymbolKind as LspSymbolKind,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
+    WorkDoneProgressOptions, WorkspaceEdit,
     notification::{
         DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
         Notification as NotificationTrait, PublishDiagnostics,
     },
     request::{
-        Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, References,
-        Rename, Request as RequestTrait, WorkspaceConfiguration,
+        Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
+        HoverRequest, PrepareRenameRequest, References, Rename, Request as RequestTrait,
+        WorkspaceConfiguration,
     },
 };
 use serde::Deserialize;
@@ -162,10 +165,11 @@ fn capabilities() -> ServerCapabilities {
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
         rename_provider: Some(OneOf::Right(RenameOptions {
-            prepare_provider: Some(false),
+            prepare_provider: Some(true),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
         document_symbol_provider: Some(OneOf::Left(true)),
+        document_highlight_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".to_owned()]),
@@ -397,6 +401,60 @@ impl Server<'_> {
                                 change_annotations: None,
                             },
                         )
+                    }
+                    Err(message) => Response::new_err(
+                        request.id,
+                        lsp_server::ErrorCode::InvalidRequest as i32,
+                        message.to_owned(),
+                    ),
+                }
+            }
+            DocumentHighlightRequest::METHOD => {
+                let params: DocumentHighlightParams = serde_json::from_value(request.params)?;
+                let path = uri_path(&params.text_document_position_params.text_document.uri)?;
+                let source = self.analysis.source(&path).unwrap_or_default().to_owned();
+                let result =
+                    position_offset(&source, params.text_document_position_params.position).map(
+                        |offset| {
+                            let lines = LineIndex::new(&source);
+                            self.analysis
+                                .document_highlights(&path, offset)
+                                .into_iter()
+                                .filter_map(|range| {
+                                    let start = lines.offset_to_position(&source, range.start)?;
+                                    let end = lines.offset_to_position(&source, range.end)?;
+                                    Some(DocumentHighlight {
+                                        range: LspRange::new(
+                                            LspPosition::new(start.line, start.character),
+                                            LspPosition::new(end.line, end.character),
+                                        ),
+                                        kind: Some(DocumentHighlightKind::TEXT),
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    );
+                Response::new_ok(request.id, result)
+            }
+            PrepareRenameRequest::METHOD => {
+                let params: TextDocumentPositionParams = serde_json::from_value(request.params)?;
+                let path = uri_path(&params.text_document.uri)?;
+                let source = self.analysis.source(&path).unwrap_or_default().to_owned();
+                match position_offset(&source, params.position)
+                    .map(|offset| self.analysis.prepare_rename(&path, offset))
+                    .transpose()
+                {
+                    Ok(range) => {
+                        let lines = LineIndex::new(&source);
+                        let result = range.and_then(|range| {
+                            let start = lines.offset_to_position(&source, range.start)?;
+                            let end = lines.offset_to_position(&source, range.end)?;
+                            Some(PrepareRenameResponse::Range(LspRange::new(
+                                LspPosition::new(start.line, start.character),
+                                LspPosition::new(end.line, end.character),
+                            )))
+                        });
+                        Response::new_ok(request.id, result)
                     }
                     Err(message) => Response::new_err(
                         request.id,

@@ -147,8 +147,8 @@ legitimate reason to refuse.
 ## Capability surface
 
 `capabilities()` in `crates/wesl-lsp/src/main.rs` advertises: full-document sync, definition,
-references, rename, document symbols, hover, completion (trigger character `.`), and
-whole-document formatting. Diagnostics are pushed, not pulled.
+references, rename (with prepare), document symbols, document highlight, hover, completion
+(trigger character `.`), and whole-document formatting. Diagnostics are pushed, not pulled.
 
 Deliberately absent, with the reasoning:
 
@@ -170,8 +170,6 @@ Not yet implemented, ordered roughly by value to shader authors:
   needs a way to bound the AST print, which is not a small change.
 - **Incremental sync** — currently `FULL`. Only worth doing if large shaders show latency.
 - **`willRename` file operations** — rewriting import paths when a shader file is renamed.
-- **Prepare rename** — `rename_provider` sets `prepare_provider: false`, so editors get no
-  validated range before a rename starts.
 - **Semantic tokens, code actions, workspace symbols** — no work started.
 
 Adding a capability means touching four layers in order: `capabilities()`, a `METHOD` arm in

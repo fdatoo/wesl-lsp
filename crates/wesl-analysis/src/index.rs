@@ -247,6 +247,34 @@ impl PackageIndex {
             .collect())
     }
 
+    pub(crate) fn document_highlights(&self, path: &Path, offset: usize) -> Vec<Range<usize>> {
+        self.references(path, offset, true)
+            .into_iter()
+            .filter(|location| location.path == path)
+            .map(|location| location.range)
+            .collect()
+    }
+
+    /// Validates that `offset` sits on something renameable and returns the range the
+    /// editor should pre-fill. Rejects the same cases [`Self::rename`] would, so the
+    /// editor reports them before the user types a new name rather than after.
+    pub(crate) fn prepare_rename(
+        &self,
+        path: &Path,
+        offset: usize,
+    ) -> Result<Range<usize>, &'static str> {
+        let file = self.files.get(path).ok_or("no symbol to rename here")?;
+        let (name, range) =
+            identifier_range_at(&file.source, offset).ok_or("no symbol to rename here")?;
+        if is_builtin(&name) {
+            return Err("cannot rename a WGSL builtin");
+        }
+        if self.resolve(path, &name, offset).is_none() {
+            return Err("no symbol to rename here");
+        }
+        Ok(range)
+    }
+
     pub(crate) fn document_symbols(&self, path: &Path) -> Vec<Symbol> {
         self.files
             .get(path)
@@ -1222,6 +1250,10 @@ fn declared_type_name(source: &str, name: &str, before: usize) -> Option<String>
 }
 
 fn identifier_at(source: &str, offset: usize) -> Option<String> {
+    identifier_range_at(source, offset).map(|(name, _)| name)
+}
+
+fn identifier_range_at(source: &str, offset: usize) -> Option<(String, Range<usize>)> {
     let identifiers = tokens(source)
         .into_iter()
         .filter(|(token, _)| is_identifier(token))
@@ -1230,7 +1262,7 @@ fn identifier_at(source: &str, offset: usize) -> Option<String> {
         .iter()
         .find(|(_, range)| range.start <= offset && offset < range.end)
         .or_else(|| identifiers.iter().find(|(_, range)| range.end == offset))
-        .map(|(token, _)| (*token).to_owned())
+        .map(|(token, range)| ((*token).to_owned(), range.clone()))
 }
 
 fn identifier_ranges(source: &str, expected: &str) -> Vec<Range<usize>> {

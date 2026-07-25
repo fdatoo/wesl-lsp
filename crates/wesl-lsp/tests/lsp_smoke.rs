@@ -577,3 +577,102 @@ fn publishes_clean_then_isolated_import_diagnostics() {
     eprintln!("diagnostics verified");
     client.shutdown();
 }
+
+#[test]
+fn highlights_and_prepares_rename() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = "fn scale(factor: f32) -> f32 { return factor * factor; }\nfn main() { let x = scale(2.0); }\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["documentHighlightProvider"],
+        json!(true)
+    );
+    assert_eq!(
+        initialized["result"]["capabilities"]["renameProvider"]["prepareProvider"],
+        json!(true)
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    assert_eq!(
+        client.receive_diagnostics(&uri)["params"]["diagnostics"],
+        json!([])
+    );
+
+    // `factor` is declared once and used twice, all within this file.
+    let parameter = source.find("factor").unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/documentHighlight",
+        "params": {
+            "textDocument": {"uri": uri},
+            "position": position(source, parameter)
+        }
+    }));
+    let highlights = client.receive_response(2);
+    assert_eq!(
+        highlights["result"].as_array().unwrap().len(),
+        3,
+        "{highlights:#?}"
+    );
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/prepareRename",
+        "params": {
+            "textDocument": {"uri": uri},
+            "position": position(source, parameter)
+        }
+    }));
+    let prepared = client.receive_response(3);
+    assert_eq!(
+        prepared["result"]["start"],
+        position(source, parameter),
+        "{prepared:#?}"
+    );
+    assert_eq!(
+        prepared["result"]["end"],
+        position(source, parameter + "factor".len())
+    );
+
+    let call_site = source.find("scale(2.0)").unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "textDocument/prepareRename",
+        "params": {
+            "textDocument": {"uri": uri},
+            "position": position(source, call_site)
+        }
+    }));
+    let user_symbol = client.receive_response(4);
+    assert!(
+        user_symbol["result"].is_object(),
+        "user functions stay renameable: {user_symbol:#?}"
+    );
+
+    client.shutdown();
+}

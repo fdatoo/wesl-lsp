@@ -260,6 +260,18 @@ impl AnalysisHost {
         self.ensure_package(path).rename(path, offset, new_name)
     }
 
+    pub fn document_highlights(&mut self, path: &Path, offset: usize) -> Vec<Range<usize>> {
+        self.ensure_package(path).document_highlights(path, offset)
+    }
+
+    pub fn prepare_rename(
+        &mut self,
+        path: &Path,
+        offset: usize,
+    ) -> Result<Range<usize>, &'static str> {
+        self.ensure_package(path).prepare_rename(path, offset)
+    }
+
     pub fn document_symbols(&mut self, path: &Path) -> Vec<Symbol> {
         self.ensure_package(path).document_symbols(path)
     }
@@ -454,6 +466,35 @@ mod tests {
         assert_eq!(
             host.rename(&path, offset, "renamed"),
             Err("cannot rename a WGSL builtin")
+        );
+    }
+
+    #[test]
+    fn prepare_rename_agrees_with_rename() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("shader.wesl");
+        let source = "fn scale(factor: f32) -> f32 { return factor * sin(1.0); }";
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::default();
+        host.open(path.clone(), source.into());
+
+        let parameter = source.find("factor").unwrap();
+        assert_eq!(
+            host.prepare_rename(&path, parameter),
+            Ok(parameter..parameter + "factor".len())
+        );
+
+        let builtin = source.find("sin").unwrap();
+        assert_eq!(
+            host.prepare_rename(&path, builtin),
+            Err("cannot rename a WGSL builtin")
+        );
+        assert!(host.rename(&path, builtin, "renamed").is_err());
+
+        let literal = source.find("1.0").unwrap();
+        assert_eq!(
+            host.prepare_rename(&path, literal),
+            Err("no symbol to rename here")
         );
     }
 
