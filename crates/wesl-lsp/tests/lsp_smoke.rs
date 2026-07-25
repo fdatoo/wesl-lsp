@@ -1079,3 +1079,99 @@ fn inlay_hints_render_types_and_parameter_names() {
 
     client.shutdown();
 }
+
+#[test]
+fn incremental_changes_are_applied_in_order() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = "fn main() {\n    let value: f32 = 1.0;\n}\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    let sync = &initialized["result"]["capabilities"]["textDocumentSync"];
+    assert_eq!(sync["change"], 2, "incremental sync: {initialized:#?}");
+    assert_eq!(sync["save"]["includeText"], true, "{initialized:#?}");
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    assert_eq!(
+        client.receive_diagnostics(&uri)["params"]["diagnostics"],
+        json!([])
+    );
+
+    // Two ranged edits in one notification: retype `f32` as `bool`, then widen the literal.
+    // The second edit's range is expressed against the text left by the first.
+    let type_start = source.find("f32").unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": uri, "version": 2},
+            "contentChanges": [
+                {
+                    "range": {
+                        "start": position(source, type_start),
+                        "end": position(source, type_start + "f32".len())
+                    },
+                    "text": "bool"
+                },
+                {
+                    "range": {
+                        "start": {"line": 1, "character": 22},
+                        "end": {"line": 1, "character": 25}
+                    },
+                    "text": "2.0"
+                }
+            ]
+        }
+    }));
+
+    let diagnostics = client.receive_diagnostics(&uri);
+    let reported = diagnostics["params"]["diagnostics"].as_array().unwrap();
+    assert_eq!(reported.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        reported[0]["message"], "type mismatch: expected bool, found f32",
+        "both edits must have landed: {diagnostics:#?}"
+    );
+
+    // Reverting via a ranged edit clears the diagnostic again.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": uri, "version": 3},
+            "contentChanges": [{
+                "range": {
+                    "start": {"line": 1, "character": 15},
+                    "end": {"line": 1, "character": 19}
+                },
+                "text": "f32"
+            }]
+        }
+    }));
+    assert_eq!(
+        client.receive_diagnostics(&uri)["params"]["diagnostics"],
+        json!([]),
+        "reverting the type should clear the mismatch"
+    );
+
+    client.shutdown();
+}

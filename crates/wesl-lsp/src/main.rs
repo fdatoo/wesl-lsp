@@ -21,11 +21,12 @@ use lsp_types::{
     InlayHintServerCapabilities, InsertTextFormat, Location as LspLocation, MarkupContent,
     MarkupKind, OneOf, ParameterInformation, ParameterLabel, Position as LspPosition,
     PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
-    RenameOptions, RenameParams, SelectionRange, SelectionRangeParams,
+    RenameOptions, RenameParams, SaveOptions, SelectionRange, SelectionRangeParams,
     SelectionRangeProviderCapability, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
     SignatureHelpParams, SignatureInformation, SymbolInformation, SymbolKind as LspSymbolKind,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
-    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
     notification::{
         DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
         Notification as NotificationTrait, PublishDiagnostics,
@@ -169,7 +170,18 @@ fn resolve_workspace_root(root: PathBuf, scope_uri: Option<&Url>) -> PathBuf {
 
 fn capabilities() -> ServerCapabilities {
     ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        // `include_text` on save is deliberate: it gives an authoritative full resync on every
+        // save, which bounds how long an incremental change we failed to apply can persist.
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                    include_text: Some(true),
+                })),
+                ..TextDocumentSyncOptions::default()
+            },
+        )),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
         rename_provider: Some(OneOf::Right(RenameOptions {
@@ -265,13 +277,36 @@ impl Server<'_> {
                 let params: DidChangeTextDocumentParams =
                     serde_json::from_value(notification.params)?;
                 let path = uri_path(&params.text_document.uri)?;
-                if let Some(change) = params.content_changes.into_iter().last() {
-                    self.versions
-                        .insert(path.clone(), params.text_document.version);
-                    self.analysis.change(&path, change.text);
-                    self.pending.insert(path.clone(), Instant::now() + DEBOUNCE);
-                    log::debug!("queued diagnostics for {}", path.display());
+                if params.content_changes.is_empty() {
+                    return Ok(());
                 }
+                let mut text = self.analysis.source(&path).unwrap_or_default().to_owned();
+                for change in params.content_changes {
+                    match change.range {
+                        // A ranged change is incremental; both endpoints must be resolved
+                        // against the text as it stands before this change is applied.
+                        Some(range) => {
+                            let start = position_offset(&text, range.start);
+                            let end = position_offset(&text, range.end);
+                            match (start, end) {
+                                (Some(start), Some(end)) if start <= end => {
+                                    text.replace_range(start..end, &change.text);
+                                }
+                                _ => log::warn!(
+                                    "ignoring out-of-range change for {}; the buffer may be \
+                                     stale until the next save",
+                                    path.display()
+                                ),
+                            }
+                        }
+                        None => text = change.text,
+                    }
+                }
+                self.versions
+                    .insert(path.clone(), params.text_document.version);
+                self.analysis.change(&path, text);
+                self.pending.insert(path.clone(), Instant::now() + DEBOUNCE);
+                log::debug!("queued diagnostics for {}", path.display());
             }
             DidSaveTextDocument::METHOD => {
                 let params: DidSaveTextDocumentParams =

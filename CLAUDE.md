@@ -146,7 +146,7 @@ legitimate reason to refuse.
 
 ## Capability surface
 
-`capabilities()` in `crates/wesl-lsp/src/main.rs` advertises: full-document sync, definition,
+`capabilities()` in `crates/wesl-lsp/src/main.rs` advertises: incremental sync, definition,
 references, rename (with prepare), document symbols, document highlight, workspace symbols,
 folding ranges, selection ranges, hover, completion (trigger character `.`), signature help
 (trigger `(`, retrigger `,`), inlay hints, and whole-document formatting. Diagnostics are
@@ -184,6 +184,11 @@ identifier to the enclosing bracket rather than stepping through sub-expressions
 buffer's root on demand. Files that were never opened are still found, because `PackageIndex`
 walks the whole root — but a root nobody has opened is not searched.
 
+`didChange` applies each content change in order, resolving every ranged change against the
+text as it stands just before that change. `save` is registered with `includeText`, so a save
+is an authoritative full resync — that is what bounds the damage if a change ever fails to
+apply, and why the failure path logs and continues rather than trying to guess.
+
 Deliberately absent, with the reasoning:
 
 - **Pull diagnostics** (`textDocument/diagnostic`) — pushing is intentional, for Zed
@@ -196,7 +201,6 @@ Not yet implemented, ordered roughly by value to shader authors:
 
 - **Range formatting** — `wesl-fmt::format` is whole-document by construction; range support
   needs a way to bound the AST print, which is not a small change.
-- **Incremental sync** — currently `FULL`. Only worth doing if large shaders show latency.
 - **`willRename` file operations** — rewriting import paths when a shader file is renamed.
 - **Semantic tokens and code actions** — no work started.
 
