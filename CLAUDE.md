@@ -239,7 +239,18 @@ Two things keep it honest. Non-host-shareable types (`bool`, samplers, textures,
 runtime-sized arrays return `None` rather than a guess, and the whole struct is then skipped —
 a wrong offset is worse than no offset. And `@align`/`@size` attributes are threaded through
 by struct name, so a nested struct is measured with its own attributes rather than its natural
-layout. The unit tests check the full matrix table from the specification directly.
+layout.
+
+**naga is the oracle**, in `layout::naga_oracle`. The unit tests check the specification's
+matrix table, which only proves the table was transcribed correctly; agreeing with a separately
+written implementation that lays out real GPU buffers is the evidence that matters. It compares
+every struct in the corpus — 339 of them — on member offsets and total size.
+
+Struct *alignment* is compared only for structs with no `@align` override, and that exception is
+load-bearing rather than a fudge: naga's IR keeps each member's computed offset but discards the
+attribute, so `Layouter` derives struct alignment from member types alone, while the
+specification defines `AlignOfMember` as the attribute when present. The two are different
+quantities under `@align`. Offsets and size are unaffected and always compared.
 
 `folding.rs`, `selection.rs` and `signature.rs` work from tokens and delimiter nesting rather
 than the AST, so all three survive a buffer that does not parse — which is exactly the state

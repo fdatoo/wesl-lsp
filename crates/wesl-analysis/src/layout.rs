@@ -260,3 +260,131 @@ mod tests {
         assert_eq!(struct_layout("Buffer", &fields, &empty), None);
     }
 }
+
+/// Differential test against naga, which computes WGSL layout independently.
+///
+/// The unit tests above check this module against the specification's table, which proves the
+/// table was transcribed correctly — not that the algorithm is right. naga is a real, separately
+/// written implementation used by wgpu to lay out actual GPU buffers, so agreeing with it is the
+/// evidence that matters for a feature whose entire value is correctness.
+#[cfg(test)]
+mod naga_oracle {
+    use std::{collections::HashMap, fs, path::PathBuf};
+
+    use walkdir::WalkDir;
+
+    use super::{align_of, size_of, struct_layout};
+    use crate::{
+        index::struct_member_overrides, ty::Ty, ty::TypeEnvironment, ty::collect_struct_types,
+    };
+
+    #[test]
+    fn corpus_struct_layouts_match_naga() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        if !root.exists() {
+            return;
+        }
+        let mut compared = 0;
+        let mut mismatches = Vec::new();
+
+        for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+            let path = entry.path();
+            if !entry.file_type().is_file()
+                || path.extension().and_then(|extension| extension.to_str()) != Some("wgsl")
+            {
+                continue;
+            }
+            let Ok(source) = fs::read_to_string(path) else {
+                continue;
+            };
+            let Ok(naga_module) = naga::front::wgsl::parse_str(&source) else {
+                continue;
+            };
+            let Ok(parsed) = wgsl_parse::parse_str(&source) else {
+                continue;
+            };
+            let mut layouter = naga::proc::Layouter::default();
+            if layouter.update(naga_module.to_ctx()).is_err() {
+                continue;
+            }
+
+            let overrides = struct_member_overrides(&parsed);
+            let ours = collect_struct_types(&parsed, TypeEnvironment::default())
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+
+            for (handle, ty) in naga_module.types.iter() {
+                let Some(name) = &ty.name else {
+                    continue;
+                };
+                let naga::TypeInner::Struct { members, span } = &ty.inner else {
+                    continue;
+                };
+                let Some(fields) = ours.get(name) else {
+                    continue;
+                };
+                // We return None for anything not host-shareable; naga has nothing to compare.
+                let Some(layout) = struct_layout(name, fields, &overrides) else {
+                    continue;
+                };
+                if layout.len() != members.len() {
+                    continue;
+                }
+                compared += 1;
+
+                for (index, (mine, theirs)) in layout.iter().zip(members).enumerate() {
+                    if mine.offset != theirs.offset {
+                        mismatches.push(format!(
+                            "{}: {name}.{} offset {} but naga says {}",
+                            path.display(),
+                            index,
+                            mine.offset,
+                            theirs.offset
+                        ));
+                    }
+                }
+
+                let whole = Ty::Struct(name.clone(), fields.clone());
+                if let Some(size) = size_of(&whole, &overrides)
+                    && size != *span
+                {
+                    mismatches.push(format!(
+                        "{}: sizeof({name}) = {size} but naga says {span}",
+                        path.display()
+                    ));
+                }
+                // naga's IR keeps each member's computed offset but discards its `@align`
+                // attribute, so `Layouter` derives struct alignment from member *types* alone.
+                // The specification defines AlignOfMember as the attribute when present, so the
+                // two quantities only coincide without overrides — compare them only there.
+                // Offsets and size above are unaffected: naga's front end applies `@align`
+                // before the IR, and those agreed on these structs too.
+                let overridden = overrides
+                    .get(name)
+                    .is_some_and(|members| members.iter().any(|(align, _)| align.is_some()));
+                if let Some(alignment) = align_of(&whole, &overrides)
+                    && !overridden
+                    && alignment != layouter[handle].alignment.round_up(1)
+                {
+                    mismatches.push(format!(
+                        "{}: alignof({name}) = {alignment} but naga says {}",
+                        path.display(),
+                        layouter[handle].alignment.round_up(1)
+                    ));
+                }
+            }
+        }
+
+        eprintln!("compared {compared} structs against naga");
+        assert!(
+            compared >= 50,
+            "only compared {compared} structs; the corpus is probably missing"
+        );
+        assert!(
+            mismatches.is_empty(),
+            "{} layout disagreement(s) with naga:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+}

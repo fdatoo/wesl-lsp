@@ -1124,6 +1124,63 @@ fn vs_main(in: VsIn) -> VsOut {
     }
 
     #[test]
+    fn dialect_files_get_navigation_but_no_type_conclusions() {
+        use crate::{InlayHintConfig, InlayKind};
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("main.wgsl");
+        // `preprocess` blanks the directives but keeps both branch bodies, so the parsed
+        // module contains two contradictory `value` definitions at once. Any type inferred
+        // from that is fiction.
+        let source = concat!(
+            "#define_import_path bevy_pbr::demo\n",
+            "struct Camera { origin: vec3<f32>, focal: f32, }\n",
+            "#ifdef HIGH_PRECISION\n",
+            "fn value() -> f32 { return 1.0; }\n",
+            "#else\n",
+            "fn value() -> f32 { return 2.0; }\n",
+            "#endif\n",
+            "fn main() { let tint = value(); }\n",
+        );
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::new(Some(root));
+        host.open(path.clone(), source.into());
+
+        let hints = host.inlay_hints(
+            &path,
+            0..source.len(),
+            InlayHintConfig {
+                type_hints: true,
+                parameter_hints: true,
+                struct_layout_hints: true,
+            },
+        );
+        assert!(
+            !hints
+                .iter()
+                .any(|hint| matches!(hint.kind, InlayKind::Type | InlayKind::Layout)),
+            "type-level hints must be suppressed on dialect files: {hints:#?}"
+        );
+
+        // Diagnostics already drew this line; hints now sit on the same side of it.
+        assert!(host.diagnostics(&path).is_empty());
+
+        // Navigation is deliberately still supported.
+        let call = source.rfind("value()").unwrap();
+        assert!(
+            host.definition(&path, call).is_some(),
+            "navigation must keep working on dialect files"
+        );
+        assert!(
+            host.completions(&path, call)
+                .iter()
+                .any(|completion| completion.label == "value")
+        );
+        assert!(!host.document_symbols(&path).is_empty());
+    }
+
+    #[test]
     fn naga_oil_imports_navigate_without_type_errors() {
         let temp = tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();

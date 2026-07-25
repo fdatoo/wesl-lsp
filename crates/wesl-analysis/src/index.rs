@@ -117,6 +117,10 @@ struct FileIndex {
     imported_modules: Vec<ModulePath>,
     oil_imports: Vec<(String, Range<usize>)>,
     oil_definitions: Vec<(String, Range<usize>)>,
+    /// A naga_oil file. `dialect::preprocess` blanks the directives but keeps every branch,
+    /// so the parsed module merges the bodies of `#ifdef` and `#else` into one contradictory
+    /// picture. Navigation still works over it; type-level conclusions do not.
+    dialect: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -413,7 +417,11 @@ impl PackageIndex {
         };
         let mut hints = Vec::new();
 
+        // Type and layout hints are type-level conclusions, so they are unsound on a merged
+        // dialect module for the same reason `AnalysisHost::diagnostics` skips it. Parameter
+        // hints are name-level and stay, as does navigation.
         if let Some(module) = file.module.as_deref()
+            && !file.dialect
             && (config.type_hints || config.struct_layout_hints)
         {
             let mut active = HashSet::from([path.to_path_buf()]);
@@ -1149,6 +1157,7 @@ impl FileIndex {
     fn new(path: PathBuf, source: Arc<str>) -> Self {
         let oil_imports = dialect::imports(&source);
         let oil_definitions = dialect::definitions(&source);
+        let dialect = dialect::is_naga_oil(&source);
         let processed = dialect::preprocess(&source);
         let Ok(module) = parse_str(&processed) else {
             return Self {
@@ -1160,6 +1169,7 @@ impl FileIndex {
                 imported_modules: Vec::new(),
                 oil_imports,
                 oil_definitions,
+                dialect,
             };
         };
         let symbols = index_symbols(&path, &source, &module);
@@ -1174,6 +1184,7 @@ impl FileIndex {
             imported_modules,
             oil_imports,
             oil_definitions,
+            dialect,
         }
     }
 }
@@ -1706,7 +1717,7 @@ fn struct_layout_hints(
 }
 
 /// `@align`/`@size` attributes per struct member, in declaration order.
-fn struct_member_overrides(module: &TranslationUnit) -> MemberOverrides {
+pub(crate) fn struct_member_overrides(module: &TranslationUnit) -> MemberOverrides {
     module
         .global_declarations
         .iter()
