@@ -24,11 +24,12 @@ use lsp_types::{
     InitializeParams, InitializeResult, InlayHint as LspInlayHint, InlayHintKind, InlayHintLabel,
     InlayHintOptions, InlayHintParams, InlayHintServerCapabilities, InsertTextFormat,
     Location as LspLocation, MarkupContent, MarkupKind, OneOf, ParameterInformation,
-    ParameterLabel, Position as LspPosition, PrepareRenameResponse, PublishDiagnosticsParams,
-    Range as LspRange, ReferenceParams, RelatedFullDocumentDiagnosticReport, RenameFilesParams,
-    RenameOptions, RenameParams, SaveOptions, SelectionRange, SelectionRangeParams,
-    SelectionRangeProviderCapability, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
-    SignatureHelpParams, SignatureInformation, SymbolInformation, SymbolKind as LspSymbolKind,
+    ParameterLabel, Position as LspPosition, PositionEncodingKind, PrepareRenameResponse,
+    PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
+    RelatedFullDocumentDiagnosticReport, RenameFilesParams, RenameOptions, RenameParams,
+    SaveOptions, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
+    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    SignatureInformation, SymbolInformation, SymbolKind as LspSymbolKind,
     TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
     TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkDoneProgressOptions,
     WorkspaceEdit, WorkspaceFileOperationsServerCapabilities, WorkspaceFoldersServerCapabilities,
@@ -49,8 +50,8 @@ use serde::Deserialize;
 use wesl_analysis::{
     AnalysisHost, Completion as AnalysisCompletion, CompletionKind, DiagnosticSeverity, FoldKind,
     FoldingRange as AnalysisFoldingRange, InlayHint as AnalysisInlayHint, InlayHintConfig,
-    InlayKind, LineIndex, SignatureHelp as AnalysisSignatureHelp, Symbol, SymbolKind,
-    WorkspaceSymbol as AnalysisWorkspaceSymbol,
+    InlayKind, LineIndex, PositionEncoding, SignatureHelp as AnalysisSignatureHelp, Symbol,
+    SymbolKind, WorkspaceSymbol as AnalysisWorkspaceSymbol,
 };
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -143,6 +144,19 @@ fn main() -> Result<()> {
     configuration.root = configuration
         .root
         .map(|root| resolve_workspace_root(root, configuration_scope.as_ref()));
+    // The analysis crate is byte-offset native, so UTF-8 removes the conversion rather than
+    // swapping it for another. UTF-16 is the protocol default and the universal fallback.
+    let offers_utf8 = initialize_params
+        .capabilities
+        .general
+        .as_ref()
+        .and_then(|general| general.position_encodings.as_ref())
+        .is_some_and(|encodings| encodings.contains(&PositionEncodingKind::UTF8));
+    let encoding = if offers_utf8 {
+        PositionEncoding::Utf8
+    } else {
+        PositionEncoding::Utf16
+    };
     let pull_diagnostics = initialize_params
         .capabilities
         .text_document
@@ -150,7 +164,7 @@ fn main() -> Result<()> {
         .and_then(|text_document| text_document.diagnostic.as_ref())
         .is_some();
     let result = InitializeResult {
-        capabilities: capabilities(pull_diagnostics),
+        capabilities: capabilities(pull_diagnostics, encoding),
         server_info: Some(lsp_types::ServerInfo {
             name: "wesl-lsp".into(),
             version: Some(env!("CARGO_PKG_VERSION").into()),
@@ -197,6 +211,7 @@ fn main() -> Result<()> {
         configuration_scope,
         supports_configuration,
         workspace_folders,
+        encoding,
         pending_configuration: None,
     };
     server.run()?;
@@ -297,8 +312,12 @@ fn resolve_workspace_root(root: PathBuf, scope_uri: Option<&Url>) -> PathBuf {
 /// support get `textDocument/diagnostic` and no pushes; everyone else — Zed among them — keeps
 /// the push path. Advertising both would leave clients that do both double-reporting, and the
 /// specification advises against mixing them.
-fn capabilities(pull_diagnostics: bool) -> ServerCapabilities {
+fn capabilities(pull_diagnostics: bool, encoding: PositionEncoding) -> ServerCapabilities {
     ServerCapabilities {
+        position_encoding: Some(match encoding {
+            PositionEncoding::Utf8 => PositionEncodingKind::UTF8,
+            PositionEncoding::Utf16 => PositionEncodingKind::UTF16,
+        }),
         diagnostic_provider: pull_diagnostics.then(|| {
             DiagnosticServerCapabilities::Options(DiagnosticOptions {
                 identifier: Some("wesl-lsp".to_owned()),
@@ -395,6 +414,7 @@ struct Server<'a> {
     supports_configuration: bool,
     /// Roots reported by the client, used only when no explicit root is configured.
     workspace_folders: Vec<PathBuf>,
+    encoding: PositionEncoding,
     /// Set while a runtime settings refresh is in flight, so its response is recognised in
     /// the main loop rather than blocking for it.
     pending_configuration: Option<RequestId>,
@@ -540,8 +560,8 @@ impl Server<'_> {
                         // A ranged change is incremental; both endpoints must be resolved
                         // against the text as it stands before this change is applied.
                         Some(range) => {
-                            let start = position_offset(&text, range.start);
-                            let end = position_offset(&text, range.end);
+                            let start = position_offset(&text, range.start, self.encoding);
+                            let end = position_offset(&text, range.end, self.encoding);
                             match (start, end) {
                                 (Some(start), Some(end)) if start <= end => {
                                     text.replace_range(start..end, &change.text);
@@ -594,40 +614,46 @@ impl Server<'_> {
                 let params: HoverParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document_position_params.text_document.uri)?;
                 let source = self.analysis.source(&path).unwrap_or_default().to_owned();
-                let result =
-                    position_offset(&source, params.text_document_position_params.position)
-                        .and_then(|offset| self.analysis.hover(&path, offset))
-                        .map(|hover| {
-                            let mut value = format!("```wesl\n{}\n```", hover.signature);
-                            if let Some(documentation) = hover.documentation {
-                                value.push_str("\n\n");
-                                value.push_str(&documentation);
-                            }
-                            Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value,
-                                }),
-                                range: None,
-                            }
-                        });
+                let result = position_offset(
+                    &source,
+                    params.text_document_position_params.position,
+                    self.encoding,
+                )
+                .and_then(|offset| self.analysis.hover(&path, offset))
+                .map(|hover| {
+                    let mut value = format!("```wesl\n{}\n```", hover.signature);
+                    if let Some(documentation) = hover.documentation {
+                        value.push_str("\n\n");
+                        value.push_str(&documentation);
+                    }
+                    Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value,
+                        }),
+                        range: None,
+                    }
+                });
                 Response::new_ok(request.id, result)
             }
             Completion::METHOD => {
                 let params: CompletionParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document_position.text_document.uri)?;
                 let source = self.analysis.source(&path).unwrap_or_default().to_owned();
-                let result = position_offset(&source, params.text_document_position.position).map(
-                    |offset| {
-                        CompletionResponse::Array(
-                            self.analysis
-                                .completions(&path, offset)
-                                .into_iter()
-                                .filter_map(completion_item)
-                                .collect(),
-                        )
-                    },
-                );
+                let result = position_offset(
+                    &source,
+                    params.text_document_position.position,
+                    self.encoding,
+                )
+                .map(|offset| {
+                    CompletionResponse::Array(
+                        self.analysis
+                            .completions(&path, offset)
+                            .into_iter()
+                            .filter_map(|item| completion_item(item, self.encoding))
+                            .collect(),
+                    )
+                });
                 Response::new_ok(request.id, result)
             }
             Formatting::METHOD => {
@@ -638,7 +664,7 @@ impl Server<'_> {
                         wesl_fmt::format(source, params.options.tab_size as usize, &path)?;
                     (formatted != source).then(|| {
                         vec![TextEdit {
-                            range: full_range(source),
+                            range: full_range(source, self.encoding),
                             new_text: formatted,
                         }]
                     })
@@ -651,10 +677,11 @@ impl Server<'_> {
                 let offset = position_offset(
                     self.analysis.source(&path).unwrap_or_default(),
                     params.text_document_position_params.position,
+                    self.encoding,
                 );
                 let result: Option<GotoDefinitionResponse> = offset
                     .and_then(|offset| self.analysis.definition(&path, offset))
-                    .and_then(lsp_location)
+                    .and_then(|location| lsp_location(location, self.encoding))
                     .map(GotoDefinitionResponse::Scalar);
                 Response::new_ok(request.id, result)
             }
@@ -664,13 +691,14 @@ impl Server<'_> {
                 let offset = position_offset(
                     self.analysis.source(&path).unwrap_or_default(),
                     params.text_document_position.position,
+                    self.encoding,
                 );
                 let result = offset
                     .map(|offset| {
                         self.analysis
                             .references(&path, offset, params.context.include_declaration)
                             .into_iter()
-                            .filter_map(lsp_location)
+                            .filter_map(|location| lsp_location(location, self.encoding))
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
@@ -682,6 +710,7 @@ impl Server<'_> {
                 let offset = position_offset(
                     self.analysis.source(&path).unwrap_or_default(),
                     params.text_document_position.position,
+                    self.encoding,
                 );
                 match offset
                     .map(|offset| self.analysis.rename(&path, offset, &params.new_name))
@@ -690,7 +719,9 @@ impl Server<'_> {
                     Ok(edits) => {
                         let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
                         for edit in edits.unwrap_or_default() {
-                            let Some(range) = lsp_range_for_file(&edit.path, edit.range) else {
+                            let Some(range) =
+                                lsp_range_for_file(&edit.path, edit.range, self.encoding)
+                            else {
                                 continue;
                             };
                             let Ok(uri) = Url::from_file_path(&edit.path) else {
@@ -729,7 +760,8 @@ impl Server<'_> {
                     };
                     let old_path = old_path.canonicalize().unwrap_or(old_path);
                     for edit in self.analysis.file_rename_edits(&old_path, &new_path) {
-                        let Some(range) = lsp_range_for_file(&edit.path, edit.range) else {
+                        let Some(range) = lsp_range_for_file(&edit.path, edit.range, self.encoding)
+                        else {
                             continue;
                         };
                         let Ok(uri) = Url::from_file_path(&edit.path) else {
@@ -788,9 +820,11 @@ impl Server<'_> {
                 let params: InlayHintParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document.uri)?;
                 let source = self.analysis.source(&path).unwrap_or_default().to_owned();
-                let lines = LineIndex::new(&source);
-                let start = position_offset(&source, params.range.start).unwrap_or(0);
-                let end = position_offset(&source, params.range.end).unwrap_or(source.len());
+                let lines = LineIndex::new(&source, self.encoding);
+                let start =
+                    position_offset(&source, params.range.start, self.encoding).unwrap_or(0);
+                let end = position_offset(&source, params.range.end, self.encoding)
+                    .unwrap_or(source.len());
                 let hints = self.configuration.inlay_hints.to_config();
                 let result = self
                     .analysis
@@ -804,22 +838,25 @@ impl Server<'_> {
                 let params: SignatureHelpParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document_position_params.text_document.uri)?;
                 let source = self.analysis.source(&path).unwrap_or_default().to_owned();
-                let result =
-                    position_offset(&source, params.text_document_position_params.position)
-                        .and_then(|offset| self.analysis.signature_help(&path, offset))
-                        .map(lsp_signature_help);
+                let result = position_offset(
+                    &source,
+                    params.text_document_position_params.position,
+                    self.encoding,
+                )
+                .and_then(|offset| self.analysis.signature_help(&path, offset))
+                .map(lsp_signature_help);
                 Response::new_ok(request.id, result)
             }
             SelectionRangeRequest::METHOD => {
                 let params: SelectionRangeParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document.uri)?;
                 let source = self.analysis.source(&path).unwrap_or_default().to_owned();
-                let lines = LineIndex::new(&source);
+                let lines = LineIndex::new(&source, self.encoding);
                 let result = params
                     .positions
                     .into_iter()
                     .map(|position| {
-                        position_offset(&source, position)
+                        position_offset(&source, position, self.encoding)
                             .map(|offset| self.analysis.selection_ranges(&path, offset))
                             .and_then(|ranges| lsp_selection_range(&source, &lines, ranges))
                             .unwrap_or_else(|| SelectionRange {
@@ -834,7 +871,7 @@ impl Server<'_> {
                 let params: FoldingRangeParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document.uri)?;
                 let source = self.analysis.source(&path).unwrap_or_default().to_owned();
-                let lines = LineIndex::new(&source);
+                let lines = LineIndex::new(&source, self.encoding);
                 let result = self
                     .analysis
                     .folding_ranges(&path)
@@ -849,7 +886,7 @@ impl Server<'_> {
                     .analysis
                     .workspace_symbols(&params.query)
                     .into_iter()
-                    .filter_map(workspace_symbol_information)
+                    .filter_map(|found| workspace_symbol_information(found, self.encoding))
                     .collect();
                 Response::new_ok(request.id, WorkspaceSymbolResponse::Flat(symbols))
             }
@@ -857,39 +894,41 @@ impl Server<'_> {
                 let params: DocumentHighlightParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document_position_params.text_document.uri)?;
                 let source = self.analysis.source(&path).unwrap_or_default().to_owned();
-                let result =
-                    position_offset(&source, params.text_document_position_params.position).map(
-                        |offset| {
-                            let lines = LineIndex::new(&source);
-                            self.analysis
-                                .document_highlights(&path, offset)
-                                .into_iter()
-                                .filter_map(|range| {
-                                    let start = lines.offset_to_position(&source, range.start)?;
-                                    let end = lines.offset_to_position(&source, range.end)?;
-                                    Some(DocumentHighlight {
-                                        range: LspRange::new(
-                                            LspPosition::new(start.line, start.character),
-                                            LspPosition::new(end.line, end.character),
-                                        ),
-                                        kind: Some(DocumentHighlightKind::TEXT),
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        },
-                    );
+                let result = position_offset(
+                    &source,
+                    params.text_document_position_params.position,
+                    self.encoding,
+                )
+                .map(|offset| {
+                    let lines = LineIndex::new(&source, self.encoding);
+                    self.analysis
+                        .document_highlights(&path, offset)
+                        .into_iter()
+                        .filter_map(|range| {
+                            let start = lines.offset_to_position(&source, range.start)?;
+                            let end = lines.offset_to_position(&source, range.end)?;
+                            Some(DocumentHighlight {
+                                range: LspRange::new(
+                                    LspPosition::new(start.line, start.character),
+                                    LspPosition::new(end.line, end.character),
+                                ),
+                                kind: Some(DocumentHighlightKind::TEXT),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
                 Response::new_ok(request.id, result)
             }
             PrepareRenameRequest::METHOD => {
                 let params: TextDocumentPositionParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document.uri)?;
                 let source = self.analysis.source(&path).unwrap_or_default().to_owned();
-                match position_offset(&source, params.position)
+                match position_offset(&source, params.position, self.encoding)
                     .map(|offset| self.analysis.prepare_rename(&path, offset))
                     .transpose()
                 {
                     Ok(range) => {
-                        let lines = LineIndex::new(&source);
+                        let lines = LineIndex::new(&source, self.encoding);
                         let result = range.and_then(|range| {
                             let start = lines.offset_to_position(&source, range.start)?;
                             let end = lines.offset_to_position(&source, range.end)?;
@@ -914,7 +953,7 @@ impl Server<'_> {
                     .analysis
                     .document_symbols(&path)
                     .into_iter()
-                    .filter_map(|symbol| document_symbol(&path, symbol))
+                    .filter_map(|symbol| document_symbol(&path, symbol, self.encoding))
                     .collect();
                 Response::new_ok(request.id, DocumentSymbolResponse::Nested(symbols))
             }
@@ -995,7 +1034,7 @@ impl Server<'_> {
             .map(Cow::Borrowed)
             .or_else(|| std::fs::read_to_string(path).ok().map(Cow::Owned))
             .unwrap_or_default();
-        let lines = LineIndex::new(&source);
+        let lines = LineIndex::new(&source, self.encoding);
         diagnostics
             .into_iter()
             .map(|diagnostic| {
@@ -1022,7 +1061,7 @@ impl Server<'_> {
                                     LspPosition::new(end.line, end.character),
                                 )
                             } else {
-                                lsp_range_for_file(&related_path, related_range)?
+                                lsp_range_for_file(&related_path, related_range, self.encoding)?
                             };
                             Some(DiagnosticRelatedInformation {
                                 location: LspLocation::new(
@@ -1053,10 +1092,13 @@ impl Server<'_> {
     }
 }
 
-fn completion_item(completion: AnalysisCompletion) -> Option<CompletionItem> {
+fn completion_item(
+    completion: AnalysisCompletion,
+    encoding: PositionEncoding,
+) -> Option<CompletionItem> {
     let additional_text_edits = if let Some(edit) = completion.additional_edit {
         Some(vec![TextEdit {
-            range: lsp_range_for_file(&edit.path, edit.range)?,
+            range: lsp_range_for_file(&edit.path, edit.range, encoding)?,
             new_text: edit.new_text,
         }])
     } else {
@@ -1087,8 +1129,12 @@ fn completion_item(completion: AnalysisCompletion) -> Option<CompletionItem> {
     })
 }
 
-fn position_offset(source: &str, position: LspPosition) -> Option<usize> {
-    LineIndex::new(source).position_to_offset(
+fn position_offset(
+    source: &str,
+    position: LspPosition,
+    encoding: PositionEncoding,
+) -> Option<usize> {
+    LineIndex::new(source, encoding).position_to_offset(
         source,
         wesl_analysis::Position {
             line: position.line,
@@ -1097,8 +1143,8 @@ fn position_offset(source: &str, position: LspPosition) -> Option<usize> {
     )
 }
 
-fn full_range(source: &str) -> LspRange {
-    let end = LineIndex::new(source)
+fn full_range(source: &str, encoding: PositionEncoding) -> LspRange {
+    let end = LineIndex::new(source, encoding)
         .offset_to_position(source, source.len())
         .unwrap_or(wesl_analysis::Position {
             line: 0,
@@ -1110,9 +1156,13 @@ fn full_range(source: &str) -> LspRange {
     )
 }
 
-fn lsp_range_for_file(path: &Path, range: std::ops::Range<usize>) -> Option<LspRange> {
+fn lsp_range_for_file(
+    path: &Path,
+    range: std::ops::Range<usize>,
+    encoding: PositionEncoding,
+) -> Option<LspRange> {
     let source = std::fs::read_to_string(path).ok()?;
-    let lines = LineIndex::new(&source);
+    let lines = LineIndex::new(&source, encoding);
     let start = lines.offset_to_position(&source, range.start)?;
     let end = lines.offset_to_position(&source, range.end)?;
     Some(LspRange::new(
@@ -1121,10 +1171,13 @@ fn lsp_range_for_file(path: &Path, range: std::ops::Range<usize>) -> Option<LspR
     ))
 }
 
-fn lsp_location(location: wesl_analysis::Location) -> Option<LspLocation> {
+fn lsp_location(
+    location: wesl_analysis::Location,
+    encoding: PositionEncoding,
+) -> Option<LspLocation> {
     Some(LspLocation::new(
         Url::from_file_path(&location.path).ok()?,
-        lsp_range_for_file(&location.path, location.range)?,
+        lsp_range_for_file(&location.path, location.range, encoding)?,
     ))
 }
 
@@ -1245,7 +1298,10 @@ fn lsp_folding_range(
 /// `SymbolInformation` is deprecated in favour of the 3.17 nested `WorkspaceSymbol`, but it
 /// is what every client understands, so the flat shape is the compatible choice here.
 #[allow(deprecated)]
-fn workspace_symbol_information(found: AnalysisWorkspaceSymbol) -> Option<SymbolInformation> {
+fn workspace_symbol_information(
+    found: AnalysisWorkspaceSymbol,
+    encoding: PositionEncoding,
+) -> Option<SymbolInformation> {
     let symbol = found.symbol;
     Some(SymbolInformation {
         name: symbol.name.to_string(),
@@ -1254,7 +1310,7 @@ fn workspace_symbol_information(found: AnalysisWorkspaceSymbol) -> Option<Symbol
         deprecated: None,
         location: LspLocation::new(
             Url::from_file_path(&symbol.path).ok()?,
-            lsp_range_for_file(&symbol.path, symbol.range)?,
+            lsp_range_for_file(&symbol.path, symbol.range, encoding)?,
         ),
         container_name: found.container,
     })
@@ -1273,13 +1329,17 @@ fn lsp_symbol_kind(kind: SymbolKind) -> LspSymbolKind {
 }
 
 #[allow(deprecated)]
-fn document_symbol(path: &Path, symbol: Symbol) -> Option<DocumentSymbol> {
-    let range = lsp_range_for_file(path, symbol.full_range)?;
-    let selection_range = lsp_range_for_file(path, symbol.range)?;
+fn document_symbol(
+    path: &Path,
+    symbol: Symbol,
+    encoding: PositionEncoding,
+) -> Option<DocumentSymbol> {
+    let range = lsp_range_for_file(path, symbol.full_range, encoding)?;
+    let selection_range = lsp_range_for_file(path, symbol.range, encoding)?;
     let children = symbol
         .children
         .into_iter()
-        .filter_map(|child| document_symbol(path, child))
+        .filter_map(|child| document_symbol(path, child, encoding))
         .collect::<Vec<_>>();
     Some(DocumentSymbol {
         name: symbol.name.to_string(),

@@ -22,7 +22,7 @@ pub use index::{
 };
 pub use inlay::{InlayHint, InlayHintConfig, InlayKind};
 pub use layout::{MemberLayout, MemberOverrides, align_of, size_of, struct_layout};
-pub use line_index::{LineIndex, Position};
+pub use line_index::{LineIndex, Position, PositionEncoding};
 pub use overlay::OverlayResolver;
 pub use root::discover_root;
 pub use selection::selection_ranges;

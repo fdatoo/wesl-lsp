@@ -56,6 +56,12 @@ WESL_LSP_PRIVATE_CORPUS=/path/to/shaders cargo test --workspace
 speaks **byte offsets**, not line/character. `LineIndex` converts at the boundary, in
 `crates/wesl-lsp/src/main.rs` only. Keep it that way: no `lsp_types` in the analysis crate.
 
+Column encoding is negotiated at `initialize` and carried on `LineIndex`. UTF-16 is the
+protocol default and the fallback; UTF-8 is preferred when the client offers it, because the
+analysis crate is already byte-offset native — under UTF-8 the conversion disappears rather
+than being replaced by a different one. Both directions stay validated: a column landing
+mid-character is rejected, not rounded.
+
 Parsing and compilation come from `wesl-rs` (`wesl`, `wgsl-parse`, `wgsl-types`), pinned to a git
 rev of the `fdatoo/wesl-rs` fork. All three are pinned to the *same* rev in the workspace
 `Cargo.toml` — bump them together.
@@ -246,9 +252,7 @@ stale squiggles in dependents.
 
 Deliberately absent, with the reasoning:
 
-- **Position encoding negotiation** — UTF-16 is assumed and correct; `line_index.rs` converts
-  properly and has a test covering astral-plane characters. Negotiating UTF-8 would save
-  conversion work, but nothing is broken today.
+- *(nothing currently)*
 
 Not yet implemented, ordered roughly by value to shader authors:
 

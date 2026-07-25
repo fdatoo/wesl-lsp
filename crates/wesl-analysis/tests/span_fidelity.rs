@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use wesl_analysis::LineIndex;
+use wesl_analysis::{LineIndex, PositionEncoding};
 use wgsl_parse::{
     parse_str,
     syntax::{
@@ -19,7 +19,7 @@ impl<'a> SpanProbe<'a> {
     fn new(source: &'a str) -> Self {
         Self {
             source,
-            lines: LineIndex::new(source),
+            lines: LineIndex::new(source, PositionEncoding::default()),
             identifiers: 0,
         }
     }

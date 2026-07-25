@@ -117,7 +117,7 @@ fn shaders() -> PathBuf {
 }
 
 fn position(source: &str, offset: usize) -> Value {
-    let index = wesl_analysis::LineIndex::new(source);
+    let index = wesl_analysis::LineIndex::new(source, wesl_analysis::PositionEncoding::default());
     let position = index.offset_to_position(source, offset).unwrap();
     json!({"line": position.line, "character": position.character})
 }
@@ -1477,5 +1477,82 @@ fn renaming_a_directory_returns_import_edits() {
         "{edits:#?}"
     );
 
+    client.shutdown();
+}
+
+#[test]
+fn utf8_capable_clients_negotiate_byte_columns() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    // The emoji is 4 bytes but 2 UTF-16 units, so the encodings disagree after it.
+    let source = "// 😀 comment\nfn main() { let x: bool = 1.0; }\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {"general": {"positionEncodings": ["utf-8", "utf-16"]}},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["positionEncoding"], "utf-8",
+        "{initialized:#?}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+
+    // The diagnostic sits on line 1, whose columns are unaffected by the emoji; what matters
+    // is that the server reports it in the encoding it agreed to.
+    let diagnostics = client.receive_diagnostics(&uri);
+    let reported = diagnostics["params"]["diagnostics"].as_array().unwrap();
+    assert_eq!(reported.len(), 1, "{diagnostics:#?}");
+    let literal = source.rfind("1.0").unwrap();
+    let line_start = source.find("fn main").unwrap();
+    assert_eq!(
+        reported[0]["range"]["start"],
+        json!({"line": 1, "character": literal - line_start}),
+        "{diagnostics:#?}"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn clients_without_utf8_keep_utf16() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    fs::write(root.join("main.wesl"), "const value = 1;\n").unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["positionEncoding"], "utf-16",
+        "the protocol default must survive a client that says nothing: {initialized:#?}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
     client.shutdown();
 }
