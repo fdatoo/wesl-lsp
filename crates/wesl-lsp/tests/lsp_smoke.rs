@@ -999,3 +999,83 @@ fn signature_help_covers_builtins_user_functions_and_constructors() {
 
     client.shutdown();
 }
+
+#[test]
+fn inlay_hints_render_types_and_parameter_names() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = concat!(
+        "fn shade(albedo: f32, roughness: f32) -> f32 { return albedo * roughness; }\n",
+        "fn main() {\n",
+        "    let tint = 0.5;\n",
+        "    let lit = shade(tint, 0.25);\n",
+        "}\n",
+    );
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert!(
+        initialized["result"]["capabilities"]["inlayHintProvider"] != json!(null),
+        "{initialized:#?}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    client.receive_diagnostics(&uri);
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/inlayHint",
+        "params": {
+            "textDocument": {"uri": uri},
+            "range": {
+                "start": position(source, 0),
+                "end": position(source, source.len())
+            }
+        }
+    }));
+    let hints = client.receive_response(2);
+    let rendered = hints["result"].as_array().unwrap();
+    assert!(
+        rendered
+            .iter()
+            .any(|hint| hint["label"] == ": f32" && hint["kind"] == 1),
+        "type hint: {hints:#?}"
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|hint| hint["label"] == "albedo:" && hint["kind"] == 2),
+        "parameter hint: {hints:#?}"
+    );
+
+    // The `tint` type hint must land immediately after the name.
+    let tint_end = source.find("tint =").unwrap() + "tint".len();
+    assert!(
+        rendered
+            .iter()
+            .any(|hint| hint["position"] == position(source, tint_end) && hint["label"] == ": f32"),
+        "{hints:#?}"
+    );
+
+    client.shutdown();
+}

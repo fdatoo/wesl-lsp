@@ -8,8 +8,8 @@ use std::{
 use wgsl_parse::{parse_str, syntax::TranslationUnit};
 
 use crate::{
-    Completion, FoldingRange, HoverInfo, Location, OverlayResolver, PackageIndex, SignatureHelp,
-    SourceEdit, Symbol, WorkspaceSymbol, dialect, discover_root,
+    Completion, FoldingRange, HoverInfo, InlayHint, Location, OverlayResolver, PackageIndex,
+    SignatureHelp, SourceEdit, Symbol, WorkspaceSymbol, dialect, discover_root,
 };
 use wesl::Resolver;
 
@@ -320,6 +320,10 @@ impl AnalysisHost {
         self.ensure_package(path).signature_help(path, offset)
     }
 
+    pub fn inlay_hints(&mut self, path: &Path, range: Range<usize>) -> Vec<InlayHint> {
+        self.ensure_package(path).inlay_hints(path, range)
+    }
+
     pub fn completions(&mut self, path: &Path, offset: usize) -> Vec<Completion> {
         self.ensure_package(path).completions(path, offset)
     }
@@ -569,6 +573,95 @@ mod tests {
 
         assert!(host.workspace_symbols("nothing_matches_this").is_empty());
         assert!(host.workspace_symbols("").len() >= 3);
+    }
+
+    #[test]
+    fn inlay_hints_show_inferred_types_and_parameter_names() {
+        use crate::InlayKind;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("main.wesl");
+        let source = concat!(
+            "fn shade(albedo: f32, roughness: f32) -> f32 { return albedo * roughness; }\n",
+            "fn main() {\n",
+            "    let tint = 0.5;\n",
+            "    let annotated: f32 = 1.0;\n",
+            "    let lit = shade(tint, 0.25);\n",
+            "}\n",
+        );
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::new(Some(root));
+        host.open(path.clone(), source.into());
+
+        let hints = host.inlay_hints(&path, 0..source.len());
+        let rendered = hints
+            .iter()
+            .map(|hint| (hint.kind, hint.label.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.contains(&(InlayKind::Type, ": f32")),
+            "inferred let should be hinted: {rendered:#?}"
+        );
+        // An explicitly annotated declaration must not be hinted.
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|(kind, _)| *kind == InlayKind::Type)
+                .count(),
+            2,
+            "only `tint` and `lit` lack annotations: {rendered:#?}"
+        );
+        // `tint` is passed to the `albedo` parameter, `0.25` to `roughness`.
+        assert!(
+            rendered.contains(&(InlayKind::Parameter, "albedo:")),
+            "{rendered:#?}"
+        );
+        assert!(
+            rendered.contains(&(InlayKind::Parameter, "roughness:")),
+            "{rendered:#?}"
+        );
+
+        // Hints are anchored where the editor should draw them.
+        let type_hint = hints
+            .iter()
+            .find(|hint| hint.kind == InlayKind::Type)
+            .unwrap();
+        assert_eq!(
+            &source[..type_hint.offset],
+            &source[..source.find("tint").unwrap() + "tint".len()]
+        );
+
+        // Requesting a sub-range returns only the hints inside it.
+        let second_line = source.find("let lit").unwrap();
+        let narrowed = host.inlay_hints(&path, second_line..source.len());
+        assert!(narrowed.iter().all(|hint| hint.offset >= second_line));
+        assert!(!narrowed.is_empty());
+    }
+
+    #[test]
+    fn parameter_hints_are_suppressed_when_the_name_already_matches() {
+        use crate::InlayKind;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("main.wesl");
+        let source = concat!(
+            "fn shade(albedo: f32, roughness: f32) -> f32 { return albedo * roughness; }\n",
+            "fn main(albedo: f32) { let x = shade(albedo, 0.5); }\n",
+        );
+        fs::write(&path, source).unwrap();
+        let mut host = AnalysisHost::new(Some(root));
+        host.open(path.clone(), source.into());
+
+        let labels = host
+            .inlay_hints(&path, 0..source.len())
+            .into_iter()
+            .filter(|hint| hint.kind == InlayKind::Parameter)
+            .map(|hint| hint.label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["roughness:".to_owned()], "{labels:#?}");
     }
 
     #[test]

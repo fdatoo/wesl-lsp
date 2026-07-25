@@ -64,6 +64,82 @@ pub fn enclosing_call(source: &str, offset: usize) -> Option<(String, usize)> {
         .find_map(|(callee, arguments)| callee.map(|name| (name, arguments)))
 }
 
+/// A resolved call in the source, with the byte offset where each argument begins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallSite {
+    pub callee: String,
+    pub callee_range: Range<usize>,
+    pub arguments: Vec<usize>,
+}
+
+/// Every call in `source`, innermost first by completion order. Parenthesised groupings
+/// nest but produce no call, matching [`enclosing_call`].
+pub fn call_sites(source: &str) -> Vec<CallSite> {
+    struct Frame {
+        callee: Option<(String, Range<usize>)>,
+        arguments: Vec<usize>,
+        awaiting_argument: bool,
+    }
+
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut calls = Vec::new();
+    let mut previous: Option<(&str, Range<usize>)> = None;
+    for (token, range) in tokens(source) {
+        // Any token that opens an argument marks where that argument starts.
+        if !matches!(token, ")" | ",")
+            && let Some(frame) = stack.last_mut()
+            && frame.awaiting_argument
+        {
+            frame.arguments.push(range.start);
+            frame.awaiting_argument = false;
+        }
+        match token {
+            "(" => stack.push(Frame {
+                callee: previous
+                    .clone()
+                    .filter(|(name, _)| is_identifier(name) && !CONTROL_FLOW.contains(name))
+                    .map(|(name, range)| (name.to_owned(), range)),
+                arguments: Vec::new(),
+                awaiting_argument: true,
+            }),
+            ")" => {
+                if let Some(frame) = stack.pop()
+                    && let Some((callee, callee_range)) = frame.callee
+                {
+                    calls.push(CallSite {
+                        callee,
+                        callee_range,
+                        arguments: frame.arguments,
+                    });
+                }
+            }
+            "," => {
+                if let Some(frame) = stack.last_mut() {
+                    frame.awaiting_argument = true;
+                }
+            }
+            _ => {}
+        }
+        previous = Some((token, range));
+    }
+    calls
+}
+
+/// Parameter names pulled out of a signature label, e.g. `e` from `e: T`.
+pub fn parameter_names(label: &str) -> Vec<String> {
+    parameter_spans(label)
+        .into_iter()
+        .map(|span| {
+            label[span]
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        })
+        .collect()
+}
+
 /// Byte ranges of each parameter inside a signature label, found by splitting the first
 /// parenthesised group on commas that sit at nesting depth zero. Template arguments are
 /// tracked too, so `array<f32, 4>` stays one parameter.
@@ -170,6 +246,48 @@ mod tests {
             .map(|span| &templated[span.clone()])
             .collect::<Vec<_>>();
         assert_eq!(parameters, vec!["target: array<f32, 4>", "value: f32"]);
+    }
+
+    #[test]
+    fn call_sites_record_each_argument_start() {
+        use super::call_sites;
+        let source = "fn main() { let x = mix(a, g(b), c); }";
+        let calls = call_sites(source);
+
+        let outer = calls.iter().find(|call| call.callee == "mix").unwrap();
+        let starts = outer
+            .arguments
+            .iter()
+            .map(|start| &source[*start..*start + 1])
+            .collect::<Vec<_>>();
+        assert_eq!(starts, vec!["a", "g", "c"]);
+
+        let inner = calls.iter().find(|call| call.callee == "g").unwrap();
+        assert_eq!(inner.arguments.len(), 1);
+        assert_eq!(&source[inner.callee_range.clone()], "g");
+
+        // A parenthesised group still opens an argument of the enclosing call.
+        let grouped = call_sites("fn main() { f((a + b), c); }");
+        assert_eq!(
+            grouped
+                .iter()
+                .find(|c| c.callee == "f")
+                .unwrap()
+                .arguments
+                .len(),
+            2
+        );
+
+        assert!(call_sites("fn main() { f(); }")[0].arguments.is_empty());
+    }
+
+    #[test]
+    fn parameter_names_drop_their_types() {
+        use super::parameter_names;
+        assert_eq!(
+            parameter_names("@const @must_use fn clamp ( e: T, low: T, high: T ) -> T"),
+            vec!["e", "low", "high"]
+        );
     }
 
     #[test]

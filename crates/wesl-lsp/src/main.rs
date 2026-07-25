@@ -17,30 +17,32 @@ use lsp_types::{
     Documentation, FoldingRange as LspFoldingRange, FoldingRangeKind, FoldingRangeParams,
     FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InsertTextFormat, Location as LspLocation, MarkupContent, MarkupKind, OneOf,
-    ParameterInformation, ParameterLabel, Position as LspPosition, PrepareRenameResponse,
-    PublishDiagnosticsParams, Range as LspRange, ReferenceParams, RenameOptions, RenameParams,
-    SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability, ServerCapabilities,
-    SignatureHelp, SignatureHelpOptions, SignatureHelpParams, SignatureInformation,
-    SymbolInformation, SymbolKind as LspSymbolKind, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions,
-    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    InlayHint as LspInlayHint, InlayHintKind, InlayHintLabel, InlayHintOptions, InlayHintParams,
+    InlayHintServerCapabilities, InsertTextFormat, Location as LspLocation, MarkupContent,
+    MarkupKind, OneOf, ParameterInformation, ParameterLabel, Position as LspPosition,
+    PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
+    RenameOptions, RenameParams, SelectionRange, SelectionRangeParams,
+    SelectionRangeProviderCapability, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
+    SignatureHelpParams, SignatureInformation, SymbolInformation, SymbolKind as LspSymbolKind,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
+    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
     notification::{
         DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
         Notification as NotificationTrait, PublishDiagnostics,
     },
     request::{
         Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest,
-        Formatting, GotoDefinition, HoverRequest, PrepareRenameRequest, References, Rename,
-        Request as RequestTrait, SelectionRangeRequest, SignatureHelpRequest,
+        Formatting, GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest,
+        References, Rename, Request as RequestTrait, SelectionRangeRequest, SignatureHelpRequest,
         WorkspaceConfiguration, WorkspaceSymbolRequest,
     },
 };
 use serde::Deserialize;
 use wesl_analysis::{
     AnalysisHost, Completion as AnalysisCompletion, CompletionKind, DiagnosticSeverity, FoldKind,
-    FoldingRange as AnalysisFoldingRange, LineIndex, SignatureHelp as AnalysisSignatureHelp,
-    Symbol, SymbolKind, WorkspaceSymbol as AnalysisWorkspaceSymbol,
+    FoldingRange as AnalysisFoldingRange, InlayHint as AnalysisInlayHint, InlayKind, LineIndex,
+    SignatureHelp as AnalysisSignatureHelp, Symbol, SymbolKind,
+    WorkspaceSymbol as AnalysisWorkspaceSymbol,
 };
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -179,6 +181,9 @@ fn capabilities() -> ServerCapabilities {
         workspace_symbol_provider: Some(OneOf::Left(true)),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+        inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+            InlayHintOptions::default(),
+        ))),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".to_owned()]),
@@ -422,6 +427,21 @@ impl Server<'_> {
                         message.to_owned(),
                     ),
                 }
+            }
+            InlayHintRequest::METHOD => {
+                let params: InlayHintParams = serde_json::from_value(request.params)?;
+                let path = uri_path(&params.text_document.uri)?;
+                let source = self.analysis.source(&path).unwrap_or_default().to_owned();
+                let lines = LineIndex::new(&source);
+                let start = position_offset(&source, params.range.start).unwrap_or(0);
+                let end = position_offset(&source, params.range.end).unwrap_or(source.len());
+                let result = self
+                    .analysis
+                    .inlay_hints(&path, start..end)
+                    .into_iter()
+                    .filter_map(|hint| lsp_inlay_hint(&source, &lines, hint))
+                    .collect::<Vec<_>>();
+                Response::new_ok(request.id, result)
             }
             SignatureHelpRequest::METHOD => {
                 let params: SignatureHelpParams = serde_json::from_value(request.params)?;
@@ -734,6 +754,30 @@ fn lsp_location(location: wesl_analysis::Location) -> Option<LspLocation> {
         Url::from_file_path(&location.path).ok()?,
         lsp_range_for_file(&location.path, location.range)?,
     ))
+}
+
+/// Type hints render after the name and parameter hints before the argument, so each side
+/// gets the padding that reads naturally: `let x: f32` and `clamp(low: 0.0)`.
+fn lsp_inlay_hint(
+    source: &str,
+    lines: &LineIndex,
+    hint: AnalysisInlayHint,
+) -> Option<LspInlayHint> {
+    let position = lines.offset_to_position(source, hint.offset)?;
+    let (kind, pad_left, pad_right) = match hint.kind {
+        InlayKind::Type => (InlayHintKind::TYPE, false, false),
+        InlayKind::Parameter => (InlayHintKind::PARAMETER, false, true),
+    };
+    Some(LspInlayHint {
+        position: LspPosition::new(position.line, position.character),
+        label: InlayHintLabel::String(hint.label),
+        kind: Some(kind),
+        text_edits: None,
+        tooltip: None,
+        padding_left: Some(pad_left),
+        padding_right: Some(pad_right),
+        data: None,
+    })
 }
 
 /// Parameter labels are sent as offsets into the signature label rather than as substrings,

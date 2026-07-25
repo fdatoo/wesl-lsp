@@ -287,12 +287,31 @@ pub(crate) fn analyze_module(
         module,
         types,
         diagnostics: Vec::new(),
+        inferred: Vec::new(),
     };
     checker.collect_types();
     checker.check_globals();
     checker.check_functions();
     checker.check_const_asserts();
     (checker.diagnostics, checker.types)
+}
+
+/// Runs the same pass as [`analyze_module`] but keeps the types it inferred for declarations
+/// that had no written annotation, which is exactly what a type inlay hint displays.
+pub(crate) fn inferred_declarations(
+    module: &TranslationUnit,
+    types: TypeEnvironment,
+) -> Vec<InferredDeclaration> {
+    let mut checker = Checker {
+        module,
+        types,
+        diagnostics: Vec::new(),
+        inferred: Vec::new(),
+    };
+    checker.collect_types();
+    checker.check_globals();
+    checker.check_functions();
+    checker.inferred
 }
 
 pub fn check_module(module: &TranslationUnit) -> Vec<TypeDiagnostic> {
@@ -309,6 +328,7 @@ pub(crate) fn infer_expression_type(
         module,
         types,
         diagnostics: Vec::new(),
+        inferred: Vec::new(),
     };
     checker.collect_types();
     checker.check_globals();
@@ -338,10 +358,15 @@ pub(crate) fn infer_expression_type(
         .collect();
     checker.infer_expression(&ExpressionNode::from(expression), &locals)
 }
+/// A declaration whose type was inferred rather than written down: the span of the whole
+/// declaration statement, the declared name, and the type the checker settled on.
+pub(crate) type InferredDeclaration = (Range<usize>, String, Ty);
+
 struct Checker<'a> {
     module: &'a TranslationUnit,
     types: TypeEnvironment,
     diagnostics: Vec<TypeDiagnostic>,
+    inferred: Vec<InferredDeclaration>,
 }
 
 impl Checker<'_> {
@@ -816,6 +841,13 @@ impl Checker<'_> {
                     actual.clone().concretize()
                 }
             });
+        if declaration.ty.is_none() && declaration.initializer.is_some() && !expected.is_unknown() {
+            self.inferred.push((
+                declaration_range.clone(),
+                declaration.ident.name().to_string(),
+                expected.clone(),
+            ));
+        }
         if let Some(initializer) = &declaration.initializer {
             self.check_compatible(
                 initializer.span().range(),

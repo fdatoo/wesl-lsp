@@ -3,6 +3,7 @@ mod builtins;
 mod dialect;
 mod folding;
 mod index;
+mod inlay;
 mod line_index;
 mod overlay;
 mod root;
@@ -18,6 +19,7 @@ pub use index::{
     Completion, CompletionKind, HoverInfo, Location, SourceEdit, Symbol, SymbolKind,
     WorkspaceSymbol,
 };
+pub use inlay::{InlayHint, InlayKind};
 pub use line_index::{LineIndex, Position};
 pub use overlay::OverlayResolver;
 pub use root::discover_root;

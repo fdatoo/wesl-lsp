@@ -9,8 +9,15 @@ use std::{
 use crate::{
     builtins::{BUILTIN_FUNCTIONS, BUILTIN_TYPES, builtin},
     dialect,
-    signature::{SignatureHelp, SignatureInfo, enclosing_call, parameter_spans},
-    ty::{Ty, TypeDiagnostic, TypeEnvironment, analyze_module, infer_expression_type},
+    inlay::{InlayHint, InlayKind},
+    signature::{
+        CallSite, SignatureHelp, SignatureInfo, call_sites, enclosing_call, parameter_names,
+        parameter_spans,
+    },
+    ty::{
+        Ty, TypeDiagnostic, TypeEnvironment, analyze_module, infer_expression_type,
+        inferred_declarations,
+    },
 };
 use smol_str::SmolStr;
 use walkdir::WalkDir;
@@ -291,6 +298,76 @@ impl PackageIndex {
             .unwrap_or_default()
     }
 
+    /// Hints whose anchor falls inside `range`. Type hints need the module to have parsed;
+    /// parameter hints are token-based and survive a broken buffer.
+    pub(crate) fn inlay_hints(&self, path: &Path, range: Range<usize>) -> Vec<InlayHint> {
+        let Some(file) = self.files.get(path) else {
+            return Vec::new();
+        };
+        let mut hints = Vec::new();
+
+        if let Some(module) = file.module.as_deref() {
+            let mut active = HashSet::from([path.to_path_buf()]);
+            let imports = self.imported_type_environment(file, &mut active);
+            for (declaration, name, ty) in inferred_declarations(module, imports) {
+                if let Some(identifier) = find_identifier(&file.source, declaration, &name)
+                    && range.contains(&identifier.end)
+                {
+                    hints.push(InlayHint {
+                        offset: identifier.end,
+                        label: format!(": {ty}"),
+                        kind: InlayKind::Type,
+                    });
+                }
+            }
+        }
+
+        for call in call_sites(&file.source) {
+            let Some(label) = self.callee_label(path, &call) else {
+                continue;
+            };
+            let names = parameter_names(&label);
+            for (index, argument) in call.arguments.iter().enumerate() {
+                let Some(name) = names.get(index).filter(|name| !name.is_empty()) else {
+                    break;
+                };
+                // Labelling `shade(albedo)` with `albedo:` is pure noise.
+                if !range.contains(argument)
+                    || identifier_at(&file.source, *argument).as_deref() == Some(name.as_str())
+                {
+                    continue;
+                }
+                hints.push(InlayHint {
+                    offset: *argument,
+                    label: format!("{name}:"),
+                    kind: InlayKind::Parameter,
+                });
+            }
+        }
+
+        hints.sort_by_key(|hint| hint.offset);
+        hints
+    }
+
+    /// The signature label to take parameter names from, for a user function, a struct used
+    /// as a constructor, or a builtin overload matching the argument count.
+    fn callee_label(&self, path: &Path, call: &CallSite) -> Option<String> {
+        if let Some(symbol) = self.resolve(path, &call.callee, call.callee_range.start) {
+            return match symbol.kind {
+                SymbolKind::Function => Some(symbol.signature.clone()),
+                SymbolKind::Struct => Some(struct_constructor_label(&symbol)),
+                _ => None,
+            };
+        }
+        let builtin = builtin(&call.callee)?;
+        builtin
+            .overloads
+            .iter()
+            .find(|overload| parameter_spans(overload.signature).len() == call.arguments.len())
+            .or_else(|| builtin.overloads.first())
+            .map(|overload| overload.signature.to_owned())
+    }
+
     pub(crate) fn signature_help(&self, path: &Path, offset: usize) -> Option<SignatureHelp> {
         let file = self.files.get(path)?;
         let (callee, active_parameter) = enclosing_call(&file.source, offset)?;
@@ -298,18 +375,7 @@ impl PackageIndex {
         if let Some(symbol) = self.resolve(path, &callee, offset) {
             let label = match symbol.kind {
                 SymbolKind::Function => symbol.signature.clone(),
-                // Structs are callable as constructors, but their indexed signature stops at
-                // the opening brace, so rebuild a call-shaped label from the members.
-                SymbolKind::Struct => format!(
-                    "{}({})",
-                    symbol.name,
-                    symbol
-                        .children
-                        .iter()
-                        .map(|member| member.signature.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+                SymbolKind::Struct => struct_constructor_label(&symbol),
                 _ => return None,
             };
             return Some(SignatureHelp {
@@ -1444,6 +1510,21 @@ pub(crate) fn is_identifier(name: &str) -> bool {
         .next()
         .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Structs are callable as constructors, but their indexed signature stops at the opening
+/// brace, so rebuild a call-shaped label from the members.
+fn struct_constructor_label(symbol: &Symbol) -> String {
+    format!(
+        "{}({})",
+        symbol.name,
+        symbol
+            .children
+            .iter()
+            .map(|member| member.signature.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Case-insensitive substring match. An empty query matches everything, which is what
