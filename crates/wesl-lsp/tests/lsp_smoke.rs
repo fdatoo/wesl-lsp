@@ -1636,3 +1636,78 @@ fn range_formatting_touches_only_the_requested_range() {
 
     client.shutdown();
 }
+
+#[test]
+fn on_type_formatting_reindents_the_current_line() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = "fn main() {\n    let x = 1;\n        }\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["documentOnTypeFormattingProvider"]["firstTriggerCharacter"],
+        "}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+    client.receive_diagnostics(&uri);
+
+    let brace = source.rfind('}').unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/onTypeFormatting",
+        "params": {
+            "textDocument": {"uri": uri},
+            "position": position(source, brace),
+            "ch": "}",
+            "options": {"tabSize": 4, "insertSpaces": true}
+        }
+    }));
+    let response = client.receive_response(2);
+    let edits = response["result"].as_array().unwrap();
+    assert_eq!(edits.len(), 1, "{response:#?}");
+    // The over-indentation is replaced with nothing, dedenting to column zero.
+    assert_eq!(edits[0]["newText"], "", "{response:#?}");
+    assert_eq!(
+        edits[0]["range"]["start"],
+        json!({"line": 2, "character": 0})
+    );
+    assert_eq!(edits[0]["range"]["end"], json!({"line": 2, "character": 8}));
+
+    // A line that is already correct yields nothing at all.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/onTypeFormatting",
+        "params": {
+            "textDocument": {"uri": uri},
+            "position": position(source, source.find("let x").unwrap()),
+            "ch": "\n",
+            "options": {"tabSize": 4, "insertSpaces": true}
+        }
+    }));
+    assert!(client.receive_response(3)["result"].is_null());
+
+    client.shutdown();
+}

@@ -16,8 +16,9 @@ use lsp_types::{
     DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportKind, DocumentDiagnosticReportResult, DocumentFormattingParams,
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
-    DocumentRangeFormattingParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-    Documentation, FileOperationFilter, FileOperationPattern, FileOperationPatternKind,
+    DocumentOnTypeFormattingOptions, DocumentOnTypeFormattingParams, DocumentRangeFormattingParams,
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
+    FileOperationFilter, FileOperationPattern, FileOperationPatternKind,
     FileOperationRegistrationOptions, FoldingRange as LspFoldingRange, FoldingRangeKind,
     FoldingRangeParams, FoldingRangeProviderCapability, FullDocumentDiagnosticReport,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
@@ -42,9 +43,9 @@ use lsp_types::{
     request::{
         Completion, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
         FoldingRangeRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
-        PrepareRenameRequest, RangeFormatting, References, Rename, Request as RequestTrait,
-        SelectionRangeRequest, SignatureHelpRequest, WillRenameFiles, WorkspaceConfiguration,
-        WorkspaceSymbolRequest,
+        OnTypeFormatting, PrepareRenameRequest, RangeFormatting, References, Rename,
+        Request as RequestTrait, SelectionRangeRequest, SignatureHelpRequest, WillRenameFiles,
+        WorkspaceConfiguration, WorkspaceSymbolRequest,
     },
 };
 use serde::Deserialize;
@@ -367,6 +368,11 @@ fn capabilities(pull_diagnostics: bool, encoding: PositionEncoding) -> ServerCap
         }),
         document_formatting_provider: Some(OneOf::Left(true)),
         document_range_formatting_provider: Some(OneOf::Left(true)),
+        // Newline covers "I just pressed enter"; `}` covers closing a block.
+        document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
+            first_trigger_character: "}".to_owned(),
+            more_trigger_character: Some(vec!["\n".to_owned()]),
+        }),
         workspace: Some(WorkspaceServerCapabilities {
             workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                 supported: Some(true),
@@ -672,6 +678,35 @@ impl Server<'_> {
                     })
                 });
                 Response::new_ok(request.id, edits)
+            }
+            OnTypeFormatting::METHOD => {
+                let params: DocumentOnTypeFormattingParams =
+                    serde_json::from_value(request.params)?;
+                let path = uri_path(&params.text_document_position.text_document.uri)?;
+                let source = self.analysis.source(&path).unwrap_or_default().to_owned();
+                let lines = LineIndex::new(&source, self.encoding);
+                let result = position_offset(
+                    &source,
+                    params.text_document_position.position,
+                    self.encoding,
+                )
+                .and_then(|offset| {
+                    let (range, indent) = wesl_analysis::reindent_line(
+                        &source,
+                        offset,
+                        params.options.tab_size as usize,
+                    )?;
+                    let from = lines.offset_to_position(&source, range.start)?;
+                    let to = lines.offset_to_position(&source, range.end)?;
+                    Some(vec![TextEdit {
+                        range: LspRange::new(
+                            LspPosition::new(from.line, from.character),
+                            LspPosition::new(to.line, to.character),
+                        ),
+                        new_text: indent,
+                    }])
+                });
+                Response::new_ok(request.id, result)
             }
             RangeFormatting::METHOD => {
                 let params: DocumentRangeFormattingParams = serde_json::from_value(request.params)?;

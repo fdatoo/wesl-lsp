@@ -166,12 +166,17 @@ would hand back an edit covering more than the client asked for. Beyond
 `MAX_ALIGNED_LINES` on either side it degrades to a single hunk rather than allocating a
 quadratic table.
 
+**On-type formatting deliberately does not use the formatter at all.** `indent.rs` re-indents
+only the current line, counting braces over the token stream. Routing it through `format()`
+would need a document that parses, and mid-keystroke it usually doesn't — the request would
+silently no-op most of the time, which reads as broken.
+
 ## Capability surface
 
 `capabilities()` in `crates/wesl-lsp/src/main.rs` advertises: incremental sync, definition,
 references, rename (with prepare), document symbols, document highlight, workspace symbols,
 folding ranges, selection ranges, hover, completion (trigger character `.`), signature help
-(trigger `(`, retrigger `,`), inlay hints, whole-document and range formatting, and
+(trigger `(`, retrigger `,`), inlay hints, whole-document / range / on-type formatting, and
 `willRenameFiles` for `.wesl`/`.wgsl` files and folders.
 
 `willRenameFiles` rewrites import paths that pointed at the renamed shader, for both file and
@@ -264,7 +269,7 @@ Deliberately absent, with the reasoning:
 
 Not yet implemented, ordered roughly by value to shader authors:
 
-- **Semantic tokens and code actions** — no work started.
+- **Semantic tokens, code actions, code lens, call hierarchy** — no work started.
 
 Adding a capability means touching four layers in order: `capabilities()`, a `METHOD` arm in
 `handle_request`, an offset-based method on `AnalysisHost`, and a case in `lsp_smoke.rs` — which
