@@ -1499,6 +1499,84 @@ fn pull_mode_honours_disabled_diagnostics_and_requests_refresh_on_change() {
     assert!(client.child.wait().unwrap().success());
 }
 
+/// Mirrors `apply_configuration`'s pull-mode branch: a watched-file event has to reach a pull
+/// client through `workspace/diagnostic/refresh` too, since that client never sees the push
+/// republish loop. Without this, an external edit to an imported shader leaves an already-open
+/// document's diagnostics stale until the client happens to re-pull on its own.
+#[test]
+fn pull_mode_watched_file_event_requests_a_refresh() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let main_path = root.join("main.wesl");
+    let main_source = "import package::helpers::scale;\nfn main() { let x: f32 = scale; }\n";
+    fs::write(&main_path, main_source).unwrap();
+    let main_uri = lsp_types::Url::from_file_path(&main_path).unwrap();
+    let helpers_path = root.join("helpers.wesl");
+    let helpers_uri = lsp_types::Url::from_file_path(&helpers_path).unwrap();
+
+    let mut client = Client::start();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {
+                "textDocument": {"diagnostic": {"dynamicRegistration": false}},
+                "workspace": {"diagnostics": {"refreshSupport": true}}
+            },
+            "initializationOptions": {"root": root, "diagnostics": {"pull": true}},
+            "rootUri": null
+        }
+    }));
+    assert_eq!(client.receive_response(1)["id"], 1);
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": main_uri,
+                "languageId": "wesl",
+                "version": 1,
+                "text": main_source
+            }
+        }
+    }));
+
+    // Nothing is pushed in pull mode, so the very next message has to be the refresh.
+    fs::write(&helpers_path, "const scale: f32 = 2.0;\n").unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeWatchedFiles",
+        "params": {"changes": [{"uri": helpers_uri, "type": 1}]}
+    }));
+    let refresh = client.receive();
+    assert_eq!(
+        refresh["method"], "workspace/diagnostic/refresh",
+        "a pull client must be asked to re-pull after a watched-file event: {refresh:#?}"
+    );
+    assert_eq!(refresh["params"], Value::Null, "{refresh:#?}");
+
+    // A second watched-file event fires before the first refresh is answered — the
+    // several-outstanding-at-once scenario JSON-RPC's id-uniqueness rule exists for.
+    fs::remove_file(&helpers_path).unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeWatchedFiles",
+        "params": {"changes": [{"uri": helpers_uri, "type": 3}]}
+    }));
+    let second_refresh = client.receive();
+    assert_eq!(second_refresh["method"], "workspace/diagnostic/refresh");
+    assert_ne!(
+        second_refresh["id"], refresh["id"],
+        "two concurrently outstanding refresh requests must not share a JSON-RPC id: \
+         {refresh:#?} vs {second_refresh:#?}"
+    );
+
+    client.shutdown();
+}
+
 /// `workspace/didChangeConfiguration` is broadcast for any editor setting, not just this
 /// server's, and `DiagnosticWorkspaceClientCapabilities` warns that a refresh "should be used
 /// with absolute care" since it forces a full re-pull of every open shader — so a settings
@@ -2028,6 +2106,259 @@ fn start_on(root: &std::path::Path) -> Client {
     assert_eq!(client.receive_response(1)["id"], 1);
     client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
     client
+}
+
+#[test]
+fn initialized_registers_watched_files_when_client_supports_dynamic_registration() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut client = Client::start();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {
+                "workspace": {"didChangeWatchedFiles": {"dynamicRegistration": true}}
+            },
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    assert_eq!(client.receive_response(1)["id"], 1);
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+    let registration = client.receive();
+    assert_eq!(registration["method"], "client/registerCapability");
+    let registrations = registration["params"]["registrations"].as_array().unwrap();
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(
+        registrations[0]["method"],
+        "workspace/didChangeWatchedFiles"
+    );
+    let watchers = registrations[0]["registerOptions"]["watchers"]
+        .as_array()
+        .unwrap();
+    assert_eq!(watchers.len(), 1);
+    assert_eq!(watchers[0]["globPattern"], "**/*.{wesl,wgsl}");
+
+    client.send(json!({"jsonrpc": "2.0", "id": registration["id"].clone(), "result": null}));
+    client.shutdown();
+}
+
+/// The regression this guards: `PackageIndex` is built once per root, the first time a
+/// request needs it, and nothing ever revisited it again. A shader created after that point
+/// stayed invisible to definition/hover/workspace-symbol forever, even though it existed on
+/// disk and unresolved-import diagnostics (which read straight from disk) found it just fine.
+/// The test reproduces the desync deliberately: it forces the package to build *before*
+/// `helpers.wesl` exists, so the fix has to come from the watched-file handlers themselves,
+/// not from a lucky first build.
+#[test]
+fn watched_file_events_keep_definitions_and_diagnostics_in_sync() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let main_path = root.join("main.wesl");
+    let main_source = "import package::helpers::scale;\nfn main() { let x: f32 = scale; }\n";
+    fs::write(&main_path, main_source).unwrap();
+    let main_uri = lsp_types::Url::from_file_path(&main_path).unwrap();
+    let helpers_path = root.join("helpers.wesl");
+    let helpers_uri = lsp_types::Url::from_file_path(&helpers_path).unwrap();
+    let usage_position = position(main_source, main_source.rfind("scale").unwrap());
+
+    let mut client = start_on(&root);
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": main_uri,
+                "languageId": "wesl",
+                "version": 1,
+                "text": main_source
+            }
+        }
+    }));
+    let opened = client.receive_diagnostics(&main_uri);
+    assert_eq!(
+        opened["params"]["diagnostics"].as_array().unwrap().len(),
+        1,
+        "helpers.wesl does not exist on disk yet, so the import must not resolve"
+    );
+
+    // Forces `ensure_package` to build and cache the root's index now, before `helpers.wesl`
+    // exists — the exact precondition the P1 desync needs.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/definition",
+        "params": {"textDocument": {"uri": main_uri}, "position": usage_position}
+    }));
+    assert_eq!(client.receive_response(2)["result"], Value::Null);
+
+    fs::write(&helpers_path, "const scale: f32 = 2.0;\n").unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeWatchedFiles",
+        "params": {"changes": [{"uri": helpers_uri, "type": 1}]}
+    }));
+
+    // The watched-file handler republishes push diagnostics, so the unresolved-import error
+    // clears now that `helpers.wesl` is indexed.
+    let refreshed = client.receive_diagnostics(&main_uri);
+    assert_eq!(refreshed["params"]["diagnostics"], json!([]));
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/definition",
+        "params": {"textDocument": {"uri": main_uri}, "position": usage_position}
+    }));
+    let definition = client.receive_response(3);
+    assert!(
+        definition["result"]["uri"]
+            .as_str()
+            .unwrap()
+            .ends_with("helpers.wesl"),
+        "{definition:#?}"
+    );
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "textDocument/hover",
+        "params": {"textDocument": {"uri": main_uri}, "position": usage_position}
+    }));
+    let hover = client.receive_response(4);
+    assert!(
+        hover["result"]["contents"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("scale"),
+        "{hover:#?}"
+    );
+
+    // Deletion mirrors creation: dropping the file from disk must make it disappear from the
+    // cached package again instead of resolving against stale contents forever.
+    fs::remove_file(&helpers_path).unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeWatchedFiles",
+        "params": {"changes": [{"uri": helpers_uri, "type": 3}]}
+    }));
+    let after_delete = client.receive_diagnostics(&main_uri);
+    assert_eq!(
+        after_delete["params"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "helpers.wesl was removed from disk, so the import must be unresolved again"
+    );
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "textDocument/definition",
+        "params": {"textDocument": {"uri": main_uri}, "position": usage_position}
+    }));
+    assert_eq!(client.receive_response(5)["result"], Value::Null);
+
+    client.shutdown();
+}
+
+/// Regression: `canonicalize()` fails with ENOENT once a file is gone, so a `DELETED` event
+/// addressed through a symlinked path component used to resolve to that raw, non-canonical
+/// path — different from the canonical path the same file's create resolved to, and different
+/// from the canonical package root, so the removal was silently dropped and hover kept
+/// resolving into a file no longer on disk.
+#[test]
+#[cfg(unix)]
+fn watched_file_deletion_through_a_symlinked_root_still_removes_the_file() {
+    let temp = tempdir().unwrap();
+    let real_root = temp.path().join("real");
+    fs::create_dir(&real_root).unwrap();
+    let link_root = temp.path().join("link");
+    std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+    let canonical_root = real_root.canonicalize().unwrap();
+
+    // The configured root is canonical, as it would be when discovered from a document path
+    // (see `resolve_workspace_root`); every URI the "client" sends below still goes through
+    // the symlink, exactly as an editor would if the user navigated the workspace that way.
+    let main_path = link_root.join("main.wesl");
+    let main_source = "import package::helpers::scale;\nfn main() { let x: f32 = scale; }\n";
+    fs::write(real_root.join("main.wesl"), main_source).unwrap();
+    let main_uri = lsp_types::Url::from_file_path(&main_path).unwrap();
+    let helpers_path = link_root.join("helpers.wesl");
+    let helpers_uri = lsp_types::Url::from_file_path(&helpers_path).unwrap();
+    let usage_position = position(main_source, main_source.rfind("scale").unwrap());
+
+    let mut client = start_on(&canonical_root);
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": main_uri,
+                "languageId": "wesl",
+                "version": 1,
+                "text": main_source
+            }
+        }
+    }));
+    client.receive_diagnostics(&main_uri);
+
+    fs::write(real_root.join("helpers.wesl"), "const scale: f32 = 2.0;\n").unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeWatchedFiles",
+        "params": {"changes": [{"uri": helpers_uri, "type": 1}]}
+    }));
+    client.receive_diagnostics(&main_uri);
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/hover",
+        "params": {"textDocument": {"uri": main_uri}, "position": usage_position}
+    }));
+    assert!(
+        client.receive_response(2)["result"]["contents"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("scale"),
+        "sanity check that the create resolved through the symlink before testing the delete"
+    );
+
+    fs::remove_file(real_root.join("helpers.wesl")).unwrap();
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeWatchedFiles",
+        "params": {"changes": [{"uri": helpers_uri, "type": 3}]}
+    }));
+    let after_delete = client.receive_diagnostics(&main_uri);
+    assert_eq!(
+        after_delete["params"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "helpers.wesl was removed through a symlinked path; the import must be unresolved \
+         again instead of the removal being silently dropped: {after_delete:#?}"
+    );
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/hover",
+        "params": {"textDocument": {"uri": main_uri}, "position": usage_position}
+    }));
+    assert_eq!(
+        client.receive_response(3)["result"],
+        Value::Null,
+        "hover must not keep resolving into a file that no longer exists"
+    );
+
+    client.shutdown();
 }
 
 #[test]

@@ -223,6 +223,15 @@ impl PackageIndex {
             .insert(path.clone(), FileIndex::new(path, source));
     }
 
+    /// Drops `path` from this package on a watched-file deletion, the counterpart to
+    /// [`Self::update`] for a file that no longer exists. Definitions, references and
+    /// workspace symbols inside it disappear immediately instead of resolving against
+    /// contents that are no longer on disk.
+    pub(crate) fn remove(&mut self, path: &Path) {
+        self.invalidate_type_cache();
+        self.files.remove(path);
+    }
+
     pub(crate) fn definition(&self, path: &Path, offset: usize) -> Option<Location> {
         if let Some(file) = self.files.get(path)
             && let Some((import, _)) = file

@@ -98,11 +98,45 @@ impl AnalysisHost {
         self.update_cached_packages(path, indexed_source);
     }
 
+    /// Drops the in-memory buffer, falling back to whatever is on disk. A closed document
+    /// is never revisited by anything else, so if the file has vanished in the meantime the
+    /// stale cached entry has to be removed here rather than left as a permanent leftover.
     pub fn close(&mut self, path: &Path) {
         self.documents.remove(path);
+        match std::fs::read_to_string(path) {
+            Ok(source) => self.update_cached_packages(path, Arc::<str>::from(source)),
+            Err(_) => self.remove_from_cached_packages(path),
+        }
+    }
+
+    /// Refreshes every already-built package containing `path` in response to a `Created`
+    /// or `Changed` watched-file event. A document open in the editor is left alone since
+    /// `open`/`change` already keep it current, and a disk read here could race an edit that
+    /// has not been saved yet. A root that has not been indexed yet needs no action either:
+    /// [`Self::ensure_package`] builds straight from disk on first use and picks up the file
+    /// naturally, so only the already-cached, otherwise-stale packages need updating.
+    pub fn file_changed(&mut self, path: &Path) {
+        if self.documents.contains_key(path) {
+            return;
+        }
         if let Ok(source) = std::fs::read_to_string(path) {
             self.update_cached_packages(path, Arc::<str>::from(source));
         }
+    }
+
+    /// Drops `path` from every already-built package in response to a `Deleted` watched-file
+    /// event — the same mirror [`Self::close`] performs for a document that disappears while
+    /// open. Without this a package indexed before the deletion would keep serving the file's
+    /// stale definitions, references and workspace symbols forever. A document still open in
+    /// the editor is left alone, same as [`Self::file_changed`]: the open buffer is the source
+    /// of truth, and evicting it here would be unrecoverable until the next edit, because the
+    /// paired `Created` event (an atomic save, a branch switch) is itself a no-op for an open
+    /// document.
+    pub fn file_removed(&mut self, path: &Path) {
+        if self.documents.contains_key(path) {
+            return;
+        }
+        self.remove_from_cached_packages(path);
     }
 
     pub fn source(&self, path: &Path) -> Option<&str> {
@@ -377,6 +411,14 @@ impl AnalysisHost {
         for (root, package) in &mut self.packages {
             if path.starts_with(root) {
                 package.update(path.to_path_buf(), source.clone());
+            }
+        }
+    }
+
+    fn remove_from_cached_packages(&mut self, path: &Path) {
+        for (root, package) in &mut self.packages {
+            if path.starts_with(root) {
+                package.remove(path);
             }
         }
     }
@@ -821,6 +863,46 @@ mod tests {
 
         assert!(host.workspace_symbols("nothing_matches_this").is_empty());
         assert!(host.workspace_symbols("").len() >= 3);
+    }
+
+    #[test]
+    fn watched_file_events_keep_workspace_symbols_in_sync() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let main_path = root.join("main.wesl");
+        let main_source = "fn main_fn() {}\n";
+        fs::write(&main_path, main_source).unwrap();
+
+        let mut host = AnalysisHost::new(Some(root.clone()));
+        host.open(main_path.clone(), main_source.into());
+        // Builds and caches the package for `root` before `extra.wesl` exists on disk,
+        // reproducing the desync a watched-file event has to correct.
+        assert!(host.workspace_symbols("extra_fn").is_empty());
+
+        let extra_path = root.join("extra.wesl");
+        fs::write(&extra_path, "fn extra_fn() {}\n").unwrap();
+        host.file_changed(&extra_path);
+        let found = host.workspace_symbols("extra_fn");
+        let names = found
+            .iter()
+            .map(|found| found.symbol.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["extra_fn"]);
+
+        host.file_removed(&extra_path);
+        assert!(host.workspace_symbols("extra_fn").is_empty());
+
+        // A DELETE event for a file that is still open in the editor must not evict it: the
+        // open buffer is the source of truth, and the paired Created event is swallowed by
+        // `file_changed`'s own open-document guard, so eviction would otherwise be
+        // unrecoverable until the next keystroke.
+        assert_eq!(host.workspace_symbols("main_fn").len(), 1);
+        host.file_removed(&main_path);
+        assert_eq!(
+            host.workspace_symbols("main_fn").len(),
+            1,
+            "an open document must survive a watched DELETE event"
+        );
     }
 
     /// Layout hints are off by default, so tests that want every kind opt in explicitly.

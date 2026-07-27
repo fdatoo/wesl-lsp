@@ -13,41 +13,43 @@ use lsp_types::{
     ConfigurationItem, ConfigurationParams, Diagnostic as LspDiagnostic, DiagnosticOptions,
     DiagnosticRelatedInformation, DiagnosticServerCapabilities,
     DiagnosticSeverity as LspDiagnosticSeverity, DidChangeTextDocumentParams,
+    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportKind, DocumentDiagnosticReportResult, DocumentFormattingParams,
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
     DocumentOnTypeFormattingOptions, DocumentOnTypeFormattingParams, DocumentRangeFormattingParams,
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Documentation, FileChangeType,
     FileOperationFilter, FileOperationPattern, FileOperationPatternKind,
-    FileOperationRegistrationOptions, FoldingRange as LspFoldingRange, FoldingRangeKind,
-    FoldingRangeParams, FoldingRangeProviderCapability, FullDocumentDiagnosticReport,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InlayHint as LspInlayHint,
-    InlayHintKind, InlayHintLabel, InlayHintOptions, InlayHintParams, InlayHintServerCapabilities,
-    InsertTextFormat, Location as LspLocation, MarkupContent, MarkupKind, OneOf,
-    ParameterInformation, ParameterLabel, Position as LspPosition, PositionEncodingKind,
-    PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange, ReferenceParams,
-    RelatedFullDocumentDiagnosticReport, RenameFilesParams, RenameOptions, RenameParams,
-    SaveOptions, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
-    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
-    SignatureInformation, SymbolInformation, SymbolKind as LspSymbolKind,
-    TextDocumentContentChangeEvent, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
-    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceFileOperationsServerCapabilities,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    FileOperationRegistrationOptions, FileSystemWatcher, FoldingRange as LspFoldingRange,
+    FoldingRangeKind, FoldingRangeParams, FoldingRangeProviderCapability,
+    FullDocumentDiagnosticReport, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InlayHint as LspInlayHint, InlayHintKind, InlayHintLabel, InlayHintOptions, InlayHintParams,
+    InlayHintServerCapabilities, InsertTextFormat, Location as LspLocation, MarkupContent,
+    MarkupKind, OneOf, ParameterInformation, ParameterLabel, Position as LspPosition,
+    PositionEncodingKind, PrepareRenameResponse, PublishDiagnosticsParams, Range as LspRange,
+    ReferenceParams, Registration, RegistrationParams, RelatedFullDocumentDiagnosticReport,
+    RenameFilesParams, RenameOptions, RenameParams, SaveOptions, SelectionRange,
+    SelectionRangeParams, SelectionRangeProviderCapability, ServerCapabilities, SignatureHelp,
+    SignatureHelpOptions, SignatureHelpParams, SignatureInformation, SymbolInformation,
+    SymbolKind as LspSymbolKind, TextDocumentContentChangeEvent, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit,
+    WorkspaceFileOperationsServerCapabilities, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities, WorkspaceSymbolParams, WorkspaceSymbolResponse,
     notification::{
-        DidChangeConfiguration, DidChangeTextDocument, DidChangeWorkspaceFolders,
-        DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+        DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles,
+        DidChangeWorkspaceFolders, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
         Notification as NotificationTrait, PublishDiagnostics,
     },
     request::{
         Completion, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
         FoldingRangeRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
-        OnTypeFormatting, PrepareRenameRequest, RangeFormatting, References, Rename,
-        Request as RequestTrait, SelectionRangeRequest, SignatureHelpRequest, WillRenameFiles,
-        WorkspaceConfiguration, WorkspaceDiagnosticRefresh, WorkspaceSymbolRequest,
+        OnTypeFormatting, PrepareRenameRequest, RangeFormatting, References, RegisterCapability,
+        Rename, Request as RequestTrait, SelectionRangeRequest, SignatureHelpRequest,
+        WillRenameFiles, WorkspaceConfiguration, WorkspaceDiagnosticRefresh,
+        WorkspaceSymbolRequest,
     },
 };
 use serde::Deserialize;
@@ -190,6 +192,16 @@ fn main() -> Result<()> {
             .as_ref()
             .and_then(|text_document| text_document.diagnostic.as_ref())
             .is_some();
+    // Whether the client can register file watchers dynamically — there is no static server
+    // capability for `workspace/didChangeWatchedFiles`. The request itself is sent below,
+    // after `initialize_finish`, once `initialized` is known to have arrived.
+    let watch_files_dynamic_registration = initialize_params
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+        .and_then(|watched_files| watched_files.dynamic_registration)
+        .unwrap_or(false);
     let result = InitializeResult {
         capabilities: capabilities(pull_diagnostics, encoding),
         server_info: Some(lsp_types::ServerInfo {
@@ -198,6 +210,14 @@ fn main() -> Result<()> {
         }),
     };
     connection.initialize_finish(initialize_id, serde_json::to_value(result)?)?;
+    // The client is only ready for server-to-client requests after `initialized`, which the
+    // call above already waited for — sending this any earlier would race the handshake.
+    if watch_files_dynamic_registration {
+        let id = RequestId::from(WATCHED_FILES_REGISTRATION_ID.to_owned());
+        connection
+            .sender
+            .send(Message::Request(watched_files_registration_request(id)))?;
+    }
     let mut startup_messages = VecDeque::new();
     if supports_configuration {
         let (fetched, queued) = request_configuration_blocking(
@@ -274,6 +294,33 @@ const DIAGNOSTIC_REFRESH_REQUEST_ID: &str = "wesl-lsp/workspace-diagnostic-refre
 /// switched on) reaches documents already showing a stale — or, when disabled, missing — result.
 fn workspace_diagnostic_refresh_request(id: RequestId) -> Request {
     Request::new(id, WorkspaceDiagnosticRefresh::METHOD.to_owned(), ())
+}
+
+const WATCHED_FILES_REGISTRATION_ID: &str = "wesl-lsp/watched-files-registration";
+
+/// Registers interest in on-disk `.wesl`/`.wgsl` changes. Nothing else keeps `PackageIndex`
+/// current once a root has been indexed — creating, editing or deleting a file outside the
+/// editor would otherwise desync definitions, references and workspace symbols from disk
+/// forever. There is no static server capability for this; dynamic registration via
+/// `client/registerCapability` is the only mechanism the specification provides.
+fn watched_files_registration_request(id: RequestId) -> Request {
+    Request::new(
+        id,
+        RegisterCapability::METHOD.to_owned(),
+        RegistrationParams {
+            registrations: vec![Registration {
+                id: WATCHED_FILES_REGISTRATION_ID.to_owned(),
+                method: DidChangeWatchedFiles::METHOD.to_owned(),
+                register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                    watchers: vec![FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.{wesl,wgsl}".to_owned()),
+                        kind: None,
+                    }],
+                })
+                .ok(),
+            }],
+        },
+    )
 }
 
 /// Startup-only: blocks for the response, queueing anything that arrives first so no
@@ -662,6 +709,29 @@ impl Server<'_> {
                 self.analysis.set_roots(self.roots());
                 for path in self.versions.keys().cloned().collect::<Vec<_>>() {
                     self.publish(&path)?;
+                }
+            }
+            DidChangeWatchedFiles::METHOD => {
+                let params: DidChangeWatchedFilesParams =
+                    serde_json::from_value(notification.params)?;
+                for change in &params.changes {
+                    let Ok(path) = uri_path(&change.uri) else {
+                        continue;
+                    };
+                    match change.typ {
+                        FileChangeType::DELETED => self.analysis.file_removed(&path),
+                        _ => self.analysis.file_changed(&path),
+                    }
+                }
+                if self.push_diagnostics {
+                    // Same republish loop `DidChangeWorkspaceFolders` uses above.
+                    for path in self.versions.keys().cloned().collect::<Vec<_>>() {
+                        self.publish(&path)?;
+                    }
+                } else {
+                    // Pull clients never see the republish above; a refresh is the only way an
+                    // external change to an imported file reaches an already-open document.
+                    self.send_diagnostics_refresh()?;
                 }
             }
             DidOpenTextDocument::METHOD => {
@@ -1625,7 +1695,32 @@ fn uri_path(uri: &Url) -> Result<PathBuf> {
     let path = uri
         .to_file_path()
         .map_err(|_| anyhow::anyhow!("URI is not a file: {uri}"))?;
-    Ok(path.canonicalize().unwrap_or(path))
+    Ok(canonicalize_best_effort(path))
+}
+
+/// Canonicalizes `path`, tolerating the file itself already being gone.
+///
+/// `canonicalize` calls `realpath(3)`, which fails with ENOENT the instant the leaf no longer
+/// exists — exactly the case for a `FileChangeType::DELETED` watched-file event, or a
+/// `close()` racing an external delete. Falling back to the raw, non-canonical path there (as
+/// opposed to here) would desync the two: a `created`/`changed` event for the very same URI
+/// canonicalizes fine, since the file still exists then, so under a symlinked root a delete
+/// would end up filed under a different path than the create was, and callers that match by a
+/// canonical root prefix (like `remove_from_cached_packages`) would silently drop the removal.
+/// Canonicalizing the parent instead keeps the deleted path on the same name everything else
+/// uses; the raw path is a last resort for when the parent is gone too (e.g. the whole
+/// directory was removed).
+fn canonicalize_best_effort(path: PathBuf) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(file_name)) => parent
+            .canonicalize()
+            .map(|canonical_parent| canonical_parent.join(file_name))
+            .unwrap_or(path),
+        _ => path,
+    }
 }
 
 #[cfg(test)]
