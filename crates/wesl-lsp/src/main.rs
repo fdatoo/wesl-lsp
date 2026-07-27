@@ -225,6 +225,7 @@ fn main() -> Result<()> {
         startup_messages,
         log_timing,
         push_diagnostics: !pull_diagnostics,
+        document_uris: HashMap::new(),
         configuration,
         configuration_scope,
         supports_configuration,
@@ -434,6 +435,12 @@ struct Server<'a> {
     log_timing: bool,
     /// False when the client pulls instead; see [`capabilities`].
     push_diagnostics: bool,
+    /// The URI exactly as the client sent it in `didOpen`, keyed by the canonicalized path.
+    /// `uri_path` normalises every incoming URI to a canonical path for internal bookkeeping,
+    /// but a symlinked root means that path may not be the URI the client actually opened —
+    /// re-emitting `Url::from_file_path` on the canonical path would then name a document the
+    /// client never saw. This is the source of truth for URIs handed back to the client.
+    document_uris: HashMap<PathBuf, Url>,
     configuration: Configuration,
     configuration_scope: Option<Url>,
     supports_configuration: bool,
@@ -593,6 +600,8 @@ impl Server<'_> {
                 let params: DidOpenTextDocumentParams =
                     serde_json::from_value(notification.params)?;
                 let path = uri_path(&params.text_document.uri)?;
+                self.document_uris
+                    .insert(path.clone(), params.text_document.uri.clone());
                 self.versions
                     .insert(path.clone(), params.text_document.version);
                 self.analysis.open(path.clone(), params.text_document.text);
@@ -640,6 +649,9 @@ impl Server<'_> {
                 self.pending.remove(&path);
                 self.versions.remove(&path);
                 self.send_diagnostics(&path, Vec::new())?;
+                // Removed only after the clearing publish above, so a symlinked document's
+                // last diagnostics notification still lands on the URI the client opened.
+                self.document_uris.remove(&path);
             }
             _ => {}
         }
@@ -710,17 +722,17 @@ impl Server<'_> {
                 let params: CompletionParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document_position.text_document.uri)?;
                 let source = self.analysis.source(&path).unwrap_or_default().to_owned();
-                let result = position_offset(
+                let offset = position_offset(
                     &source,
                     params.text_document_position.position,
                     self.encoding,
-                )
-                .map(|offset| {
+                );
+                let items = offset.map(|offset| self.analysis.completions(&path, offset));
+                let result = items.map(|items| {
                     CompletionResponse::Array(
-                        self.analysis
-                            .completions(&path, offset)
+                        items
                             .into_iter()
-                            .filter_map(|item| completion_item(item, self.encoding))
+                            .filter_map(|item| self.completion_item(item))
                             .collect(),
                     )
                 });
@@ -809,9 +821,9 @@ impl Server<'_> {
                     params.text_document_position_params.position,
                     self.encoding,
                 );
-                let result: Option<GotoDefinitionResponse> = offset
-                    .and_then(|offset| self.analysis.definition(&path, offset))
-                    .and_then(|location| lsp_location(location, self.encoding))
+                let location = offset.and_then(|offset| self.analysis.definition(&path, offset));
+                let result: Option<GotoDefinitionResponse> = location
+                    .and_then(|location| self.lsp_location_for(location))
                     .map(GotoDefinitionResponse::Scalar);
                 Response::new_ok(request.id, result)
             }
@@ -823,15 +835,16 @@ impl Server<'_> {
                     params.text_document_position.position,
                     self.encoding,
                 );
-                let result = offset
+                let locations = offset
                     .map(|offset| {
                         self.analysis
                             .references(&path, offset, params.context.include_declaration)
-                            .into_iter()
-                            .filter_map(|location| lsp_location(location, self.encoding))
-                            .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                let result = locations
+                    .into_iter()
+                    .filter_map(|location| self.lsp_location_for(location))
+                    .collect::<Vec<_>>();
                 Response::new_ok(request.id, result)
             }
             Rename::METHOD => {
@@ -849,12 +862,10 @@ impl Server<'_> {
                     Ok(edits) => {
                         let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
                         for edit in edits.unwrap_or_default() {
-                            let Some(range) =
-                                lsp_range_for_file(&edit.path, edit.range, self.encoding)
-                            else {
+                            let Some(range) = self.lsp_range_for(&edit.path, edit.range) else {
                                 continue;
                             };
-                            let Ok(uri) = Url::from_file_path(&edit.path) else {
+                            let Some(uri) = self.client_uri(&edit.path) else {
                                 continue;
                             };
                             changes.entry(uri).or_default().push(TextEdit {
@@ -890,11 +901,10 @@ impl Server<'_> {
                     };
                     let old_path = old_path.canonicalize().unwrap_or(old_path);
                     for edit in self.analysis.file_rename_edits(&old_path, &new_path) {
-                        let Some(range) = lsp_range_for_file(&edit.path, edit.range, self.encoding)
-                        else {
+                        let Some(range) = self.lsp_range_for(&edit.path, edit.range) else {
                             continue;
                         };
-                        let Ok(uri) = Url::from_file_path(&edit.path) else {
+                        let Some(uri) = self.client_uri(&edit.path) else {
                             continue;
                         };
                         changes.entry(uri).or_default().push(TextEdit {
@@ -926,7 +936,7 @@ impl Server<'_> {
                     .filter_map(|(other, diagnostics)| {
                         let items = self.lsp_diagnostics(&other, diagnostics);
                         Some((
-                            Url::from_file_path(other).ok()?,
+                            self.client_uri(&other)?,
                             DocumentDiagnosticReportKind::Full(FullDocumentDiagnosticReport {
                                 result_id: None,
                                 items,
@@ -1012,11 +1022,10 @@ impl Server<'_> {
             }
             WorkspaceSymbolRequest::METHOD => {
                 let params: WorkspaceSymbolParams = serde_json::from_value(request.params)?;
-                let symbols = self
-                    .analysis
-                    .workspace_symbols(&params.query)
+                let found = self.analysis.workspace_symbols(&params.query);
+                let symbols = found
                     .into_iter()
-                    .filter_map(|found| workspace_symbol_information(found, self.encoding))
+                    .filter_map(|found| self.workspace_symbol_information(found))
                     .collect();
                 Response::new_ok(request.id, WorkspaceSymbolResponse::Flat(symbols))
             }
@@ -1079,11 +1088,10 @@ impl Server<'_> {
             DocumentSymbolRequest::METHOD => {
                 let params: DocumentSymbolParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document.uri)?;
-                let symbols = self
-                    .analysis
-                    .document_symbols(&path)
+                let found = self.analysis.document_symbols(&path);
+                let symbols = found
                     .into_iter()
-                    .filter_map(|symbol| document_symbol(&path, symbol, self.encoding))
+                    .filter_map(|symbol| self.document_symbol(&path, symbol))
                     .collect();
                 Response::new_ok(request.id, DocumentSymbolResponse::Nested(symbols))
             }
@@ -1139,7 +1147,8 @@ impl Server<'_> {
         diagnostics: Vec<wesl_analysis::Diagnostic>,
     ) -> Result<()> {
         let params = PublishDiagnosticsParams::new(
-            Url::from_file_path(path).map_err(|_| anyhow::anyhow!("invalid file path"))?,
+            self.client_uri(path)
+                .ok_or_else(|| anyhow::anyhow!("invalid file path"))?,
             self.lsp_diagnostics(path, diagnostics),
             self.versions.get(path).copied(),
         );
@@ -1190,13 +1199,10 @@ impl Server<'_> {
                                     LspPosition::new(end.line, end.character),
                                 )
                             } else {
-                                lsp_range_for_file(&related_path, related_range, self.encoding)?
+                                self.lsp_range_for(&related_path, related_range)?
                             };
                             Some(DiagnosticRelatedInformation {
-                                location: LspLocation::new(
-                                    Url::from_file_path(related_path).ok()?,
-                                    range,
-                                ),
+                                location: LspLocation::new(self.client_uri(&related_path)?, range),
                                 message,
                             })
                         })
@@ -1219,43 +1225,118 @@ impl Server<'_> {
             })
             .collect()
     }
-}
 
-fn completion_item(
-    completion: AnalysisCompletion,
-    encoding: PositionEncoding,
-) -> Option<CompletionItem> {
-    let additional_text_edits = if let Some(edit) = completion.additional_edit {
-        Some(vec![TextEdit {
-            range: lsp_range_for_file(&edit.path, edit.range, encoding)?,
-            new_text: edit.new_text,
-        }])
-    } else {
-        None
-    };
-    let is_snippet = completion.insert_text.is_some();
-    Some(CompletionItem {
-        label: completion.label.clone(),
-        kind: Some(match completion.kind {
-            CompletionKind::Function => CompletionItemKind::FUNCTION,
-            CompletionKind::Struct => CompletionItemKind::STRUCT,
-            CompletionKind::Field => CompletionItemKind::FIELD,
-            CompletionKind::Variable => CompletionItemKind::VARIABLE,
-            CompletionKind::Type => CompletionItemKind::TYPE_PARAMETER,
-            CompletionKind::Keyword => CompletionItemKind::KEYWORD,
-            CompletionKind::Snippet => CompletionItemKind::SNIPPET,
-        }),
-        detail: completion.detail,
-        sort_text: Some(format!(
-            "{}_{}",
-            if is_snippet { "9" } else { "1" },
-            completion.label
-        )),
-        insert_text: completion.insert_text,
-        insert_text_format: is_snippet.then_some(InsertTextFormat::SNIPPET),
-        additional_text_edits,
-        ..CompletionItem::default()
-    })
+    /// The URI the client actually opened a document under, falling back to reconstructing
+    /// one from the canonical path for documents that are not open (or never were). Using
+    /// this instead of `Url::from_file_path` on the canonical path is what keeps every
+    /// emitted URI resolvable by the client under a symlinked workspace root.
+    fn client_uri(&self, path: &Path) -> Option<Url> {
+        self.document_uris
+            .get(path)
+            .cloned()
+            .or_else(|| Url::from_file_path(path).ok())
+    }
+
+    /// Converts a byte-offset range into an LSP range against the in-memory buffer when the
+    /// document is open, falling back to disk otherwise — the same source resolution
+    /// `lsp_diagnostics` uses, so an unsaved edit never desyncs the two.
+    fn lsp_range_for(&self, path: &Path, range: std::ops::Range<usize>) -> Option<LspRange> {
+        let source = self
+            .analysis
+            .source(path)
+            .map(Cow::Borrowed)
+            .or_else(|| std::fs::read_to_string(path).ok().map(Cow::Owned))?;
+        let lines = LineIndex::new(&source, self.encoding);
+        let start = lines.offset_to_position(&source, range.start)?;
+        let end = lines.offset_to_position(&source, range.end)?;
+        Some(LspRange::new(
+            LspPosition::new(start.line, start.character),
+            LspPosition::new(end.line, end.character),
+        ))
+    }
+
+    fn lsp_location_for(&self, location: wesl_analysis::Location) -> Option<LspLocation> {
+        Some(LspLocation::new(
+            self.client_uri(&location.path)?,
+            self.lsp_range_for(&location.path, location.range)?,
+        ))
+    }
+
+    fn completion_item(&self, completion: AnalysisCompletion) -> Option<CompletionItem> {
+        let additional_text_edits = if let Some(edit) = completion.additional_edit {
+            Some(vec![TextEdit {
+                range: self.lsp_range_for(&edit.path, edit.range)?,
+                new_text: edit.new_text,
+            }])
+        } else {
+            None
+        };
+        let is_snippet = completion.insert_text.is_some();
+        Some(CompletionItem {
+            label: completion.label.clone(),
+            kind: Some(match completion.kind {
+                CompletionKind::Function => CompletionItemKind::FUNCTION,
+                CompletionKind::Struct => CompletionItemKind::STRUCT,
+                CompletionKind::Field => CompletionItemKind::FIELD,
+                CompletionKind::Variable => CompletionItemKind::VARIABLE,
+                CompletionKind::Type => CompletionItemKind::TYPE_PARAMETER,
+                CompletionKind::Keyword => CompletionItemKind::KEYWORD,
+                CompletionKind::Snippet => CompletionItemKind::SNIPPET,
+            }),
+            detail: completion.detail,
+            sort_text: Some(format!(
+                "{}_{}",
+                if is_snippet { "9" } else { "1" },
+                completion.label
+            )),
+            insert_text: completion.insert_text,
+            insert_text_format: is_snippet.then_some(InsertTextFormat::SNIPPET),
+            additional_text_edits,
+            ..CompletionItem::default()
+        })
+    }
+
+    /// `SymbolInformation` is deprecated in favour of the 3.17 nested `WorkspaceSymbol`, but
+    /// it is what every client understands, so the flat shape is the compatible choice here.
+    #[allow(deprecated)]
+    fn workspace_symbol_information(
+        &self,
+        found: AnalysisWorkspaceSymbol,
+    ) -> Option<SymbolInformation> {
+        let symbol = found.symbol;
+        Some(SymbolInformation {
+            name: symbol.name.to_string(),
+            kind: lsp_symbol_kind(symbol.kind),
+            tags: None,
+            deprecated: None,
+            location: LspLocation::new(
+                self.client_uri(&symbol.path)?,
+                self.lsp_range_for(&symbol.path, symbol.range)?,
+            ),
+            container_name: found.container,
+        })
+    }
+
+    #[allow(deprecated)]
+    fn document_symbol(&self, path: &Path, symbol: Symbol) -> Option<DocumentSymbol> {
+        let range = self.lsp_range_for(path, symbol.full_range)?;
+        let selection_range = self.lsp_range_for(path, symbol.range)?;
+        let children = symbol
+            .children
+            .into_iter()
+            .filter_map(|child| self.document_symbol(path, child))
+            .collect::<Vec<_>>();
+        Some(DocumentSymbol {
+            name: symbol.name.to_string(),
+            detail: Some(symbol.signature),
+            kind: lsp_symbol_kind(symbol.kind),
+            tags: None,
+            deprecated: None,
+            range,
+            selection_range,
+            children: (!children.is_empty()).then_some(children),
+        })
+    }
 }
 
 /// Applies content changes in order, returning the new text and how many were rejected.
@@ -1317,31 +1398,6 @@ fn full_range(source: &str, encoding: PositionEncoding) -> LspRange {
         LspPosition::new(0, 0),
         LspPosition::new(end.line, end.character),
     )
-}
-
-fn lsp_range_for_file(
-    path: &Path,
-    range: std::ops::Range<usize>,
-    encoding: PositionEncoding,
-) -> Option<LspRange> {
-    let source = std::fs::read_to_string(path).ok()?;
-    let lines = LineIndex::new(&source, encoding);
-    let start = lines.offset_to_position(&source, range.start)?;
-    let end = lines.offset_to_position(&source, range.end)?;
-    Some(LspRange::new(
-        LspPosition::new(start.line, start.character),
-        LspPosition::new(end.line, end.character),
-    ))
-}
-
-fn lsp_location(
-    location: wesl_analysis::Location,
-    encoding: PositionEncoding,
-) -> Option<LspLocation> {
-    Some(LspLocation::new(
-        Url::from_file_path(&location.path).ok()?,
-        lsp_range_for_file(&location.path, location.range, encoding)?,
-    ))
 }
 
 /// Type hints render after the name and parameter hints before the argument, so each side
@@ -1458,27 +1514,6 @@ fn lsp_folding_range(
     })
 }
 
-/// `SymbolInformation` is deprecated in favour of the 3.17 nested `WorkspaceSymbol`, but it
-/// is what every client understands, so the flat shape is the compatible choice here.
-#[allow(deprecated)]
-fn workspace_symbol_information(
-    found: AnalysisWorkspaceSymbol,
-    encoding: PositionEncoding,
-) -> Option<SymbolInformation> {
-    let symbol = found.symbol;
-    Some(SymbolInformation {
-        name: symbol.name.to_string(),
-        kind: lsp_symbol_kind(symbol.kind),
-        tags: None,
-        deprecated: None,
-        location: LspLocation::new(
-            Url::from_file_path(&symbol.path).ok()?,
-            lsp_range_for_file(&symbol.path, symbol.range, encoding)?,
-        ),
-        container_name: found.container,
-    })
-}
-
 fn lsp_symbol_kind(kind: SymbolKind) -> LspSymbolKind {
     match kind {
         SymbolKind::Function => LspSymbolKind::FUNCTION,
@@ -1489,31 +1524,6 @@ fn lsp_symbol_kind(kind: SymbolKind) -> LspSymbolKind {
         SymbolKind::Override => LspSymbolKind::VARIABLE,
         SymbolKind::Alias => LspSymbolKind::TYPE_PARAMETER,
     }
-}
-
-#[allow(deprecated)]
-fn document_symbol(
-    path: &Path,
-    symbol: Symbol,
-    encoding: PositionEncoding,
-) -> Option<DocumentSymbol> {
-    let range = lsp_range_for_file(path, symbol.full_range, encoding)?;
-    let selection_range = lsp_range_for_file(path, symbol.range, encoding)?;
-    let children = symbol
-        .children
-        .into_iter()
-        .filter_map(|child| document_symbol(path, child, encoding))
-        .collect::<Vec<_>>();
-    Some(DocumentSymbol {
-        name: symbol.name.to_string(),
-        detail: Some(symbol.signature),
-        kind: lsp_symbol_kind(symbol.kind),
-        tags: None,
-        deprecated: None,
-        range,
-        selection_range,
-        children: (!children.is_empty()).then_some(children),
-    })
 }
 
 /// File-operation params carry URIs as plain strings rather than parsed `Url`s.

@@ -174,17 +174,16 @@ impl Client {
         }
     }
 
+    /// Compares the URI verbatim rather than canonicalizing both sides before matching: the
+    /// server is expected to echo back exactly the URI a document was opened under (see
+    /// `Server::client_uri` in main.rs), and canonicalizing here would silently accept a
+    /// server that instead rebuilt the URI from a canonicalized path — the exact bug this
+    /// guards against under a symlinked root (e.g. macOS's `/var` -> `/private/var`).
     fn receive_diagnostics(&mut self, uri: &lsp_types::Url) -> Value {
-        let expected_path = uri.to_file_path().unwrap().canonicalize().unwrap();
         loop {
             let message = self.receive();
             if message["method"].as_str() == Some("textDocument/publishDiagnostics")
-                && message["params"]["uri"]
-                    .as_str()
-                    .and_then(|uri| lsp_types::Url::parse(uri).ok())
-                    .and_then(|uri| uri.to_file_path().ok())
-                    .and_then(|path| path.canonicalize().ok())
-                    .is_some_and(|path| path == expected_path)
+                && message["params"]["uri"].as_str() == Some(uri.as_str())
             {
                 return message;
             }
@@ -2191,6 +2190,183 @@ fn neovim_gets_utf8_columns() {
         initialized["result"]["capabilities"]
             .get("diagnosticProvider")
             .is_none()
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn rename_uses_unsaved_buffer_offsets_not_disk() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    // Disk keeps exactly this shape for the whole test: the point is that the server must
+    // never fall back to reading it once the buffer has diverged from it.
+    let original = "fn helper() -> f32 { return 1.0; }\nfn main() { let x = helper(); }\n";
+    fs::write(&path, original).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    client.receive_response(1);
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": original}
+        }
+    }));
+    assert_eq!(
+        client.receive_diagnostics(&uri)["params"]["diagnostics"],
+        json!([])
+    );
+
+    // A ranged, unsaved edit that prepends two lines, shifting everything after down by two
+    // without ever touching disk. A conversion that reads the file back from disk instead of
+    // the live buffer computes garbage offsets here, since disk is two lines shorter.
+    let padding = "// pad\n// pad\n";
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": uri, "version": 2},
+            "contentChanges": [{
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 0}
+                },
+                "text": padding
+            }]
+        }
+    }));
+    let shifted = format!("{padding}{original}");
+    assert_eq!(
+        client.receive_diagnostics(&uri)["params"]["diagnostics"],
+        json!([]),
+        "buffer must still parse cleanly after the shift"
+    );
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        original,
+        "the edit above must stay unsaved for the rest of this test"
+    );
+
+    let definition_offset = shifted.find("helper").unwrap();
+    let call_offset = shifted.rfind("helper").unwrap();
+    assert_ne!(definition_offset, call_offset);
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/rename",
+        "params": {
+            "textDocument": {"uri": uri},
+            "position": position(&shifted, call_offset),
+            "newName": "computed"
+        }
+    }));
+    let renamed = client.receive_response(2);
+    let mut changes = renamed["result"]["changes"][uri.as_str()]
+        .as_array()
+        .unwrap_or_else(|| panic!("no edits addressed to {}: {renamed:#?}", uri.as_str()))
+        .clone();
+    assert_eq!(changes.len(), 2, "{renamed:#?}");
+    changes.sort_by_key(|edit| edit["range"]["start"]["line"].as_u64().unwrap());
+
+    // Both edits must land on the shifted buffer's coordinates, not disk's stale ones.
+    assert_eq!(changes[0]["newText"], "computed", "{renamed:#?}");
+    assert_eq!(
+        changes[0]["range"]["start"],
+        position(&shifted, definition_offset),
+        "{renamed:#?}"
+    );
+    assert_eq!(
+        changes[0]["range"]["end"],
+        position(&shifted, definition_offset + "helper".len())
+    );
+    assert_eq!(changes[1]["newText"], "computed", "{renamed:#?}");
+    assert_eq!(
+        changes[1]["range"]["start"],
+        position(&shifted, call_offset),
+        "{renamed:#?}"
+    );
+    assert_eq!(
+        changes[1]["range"]["end"],
+        position(&shifted, call_offset + "helper".len())
+    );
+
+    client.shutdown();
+}
+
+/// Under a symlinked root — macOS puts every tempdir here, Nix links do the same on Linux —
+/// the client only ever knows the document by the URI it opened, never by the canonicalized
+/// path the server uses internally. Publishing diagnostics against the latter would name a
+/// document the client never saw.
+#[cfg(unix)]
+#[test]
+fn diagnostics_publish_to_the_exact_uri_the_client_opened() {
+    let temp = tempdir().unwrap();
+    let real = temp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let root = link.clone();
+    let path = root.join("main.wesl");
+    let source = "const value = 1;\n";
+    fs::write(real.join("main.wesl"), source).unwrap();
+    // Deliberately built through the symlink and never canonicalized, exactly as a real
+    // editor sends the URI for the root it was pointed at.
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    assert_ne!(
+        path,
+        path.canonicalize().unwrap(),
+        "setup must actually involve a symlink or this test proves nothing"
+    );
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {},
+            "initializationOptions": {"root": root},
+            "rootUri": null
+        }
+    }));
+    client.receive_response(1);
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+
+    // A raw wait rather than `receive_diagnostics`, so a wrong URI fails the assertion right
+    // away instead of retrying against a message that will never match.
+    let published = loop {
+        let message = client.receive();
+        if message["method"].as_str() == Some("textDocument/publishDiagnostics") {
+            break message;
+        }
+    };
+    assert_eq!(
+        published["params"]["uri"].as_str(),
+        Some(uri.as_str()),
+        "diagnostics must publish to the URI the client actually opened, not a canonicalized \
+         stand-in it never saw: {published:#?}"
     );
 
     client.shutdown();
