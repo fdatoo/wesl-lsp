@@ -406,33 +406,36 @@ fn clamp_range(range: Range<usize>, source_len: usize) -> Range<usize> {
     start..end
 }
 
+/// Byte ranges of `import ...;` statements in source order, used to anchor
+/// diagnostics on the matching entry in `module.imports`. Scans the same
+/// comment-skipping token stream `PackageIndex` uses for identifier lookups
+/// (`crate::index::tokens`) rather than a raw substring search: `import` does
+/// not carry a span in the parsed AST (see `wgsl_parse::syntax::ImportStatement`),
+/// and a naive `str::find("import")` matches the word inside comments too,
+/// which desyncs the positional correlation with `module.imports` and lands
+/// diagnostics on comment text instead of the real import.
 fn import_statement_spans(source: &str) -> Vec<Range<usize>> {
-    let bytes = source.as_bytes();
+    let tokens = crate::index::tokens(source);
     let mut spans = Vec::new();
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let Some(relative) = source[offset..].find("import") else {
-            break;
-        };
-        let start = offset + relative;
-        let before_is_ident = start
-            .checked_sub(1)
-            .and_then(|index| bytes.get(index))
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
-        let after = start + "import".len();
-        let after_is_ident = bytes
-            .get(after)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
-        if before_is_ident || after_is_ident {
-            offset = after;
+    let mut index = 0;
+    while index < tokens.len() {
+        let (text, range) = &tokens[index];
+        if *text != "import" {
+            index += 1;
             continue;
         }
-        let Some(end_relative) = source[after..].find(';') else {
-            break;
-        };
-        let end = after + end_relative + 1;
+        let start = range.start;
+        let mut end = range.end;
+        index += 1;
+        while index < tokens.len() {
+            let (token_text, token_range) = &tokens[index];
+            end = token_range.end;
+            index += 1;
+            if *token_text == ";" {
+                break;
+            }
+        }
         spans.push(start..end);
-        offset = end;
     }
     spans
 }
@@ -474,6 +477,41 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_import_diagnostic_ignores_line_comment_decoy() {
+        // A `import ...;`-shaped line comment above the real import used to inject a
+        // phantom entry into `import_statement_spans`, which is indexed positionally
+        // against `module.imports` — shifting the diagnostic onto the comment.
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("shader.wesl");
+        fs::write(&path, "").unwrap();
+        let mut host = AnalysisHost::default();
+        let source = "// see also: import package::other::thing;\nimport package::missing::{value};\nfn main() { let x = value; }";
+        host.open(path.clone(), source.into());
+        let diagnostics = host.diagnostics(&path);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            &host.source(&path).unwrap()[diagnostics[0].range.clone()],
+            "import package::missing::{value};"
+        );
+    }
+
+    #[test]
+    fn unresolved_import_diagnostic_ignores_block_comment_decoy() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("shader.wesl");
+        fs::write(&path, "").unwrap();
+        let mut host = AnalysisHost::default();
+        let source = "/* import package::other::thing; */\nimport package::missing::{value};\nfn main() { let x = value; }";
+        host.open(path.clone(), source.into());
+        let diagnostics = host.diagnostics(&path);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            &host.source(&path).unwrap()[diagnostics[0].range.clone()],
+            "import package::missing::{value};"
+        );
+    }
+
+    #[test]
     fn cyclic_import_is_reported_once() {
         let temp = tempdir().unwrap();
         let a = temp.path().join("a.wesl");
@@ -487,6 +525,28 @@ mod tests {
         let diagnostics = host.diagnostics(&a);
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("a -> b -> a"));
+    }
+
+    #[test]
+    fn cyclic_import_diagnostic_ignores_comment_decoy() {
+        // Same phantom-span hazard as the unresolved-import case, but for the
+        // `import_spans.first()` anchor the cyclic-import diagnostic uses.
+        let temp = tempdir().unwrap();
+        let a = temp.path().join("a.wesl");
+        let b = temp.path().join("b.wesl");
+        let a_source = "// see also: import package::other::thing;\nimport package::b::b_value;\nconst a_value = b_value;";
+        let b_source = "import package::a::a_value;\nconst b_value = a_value;";
+        fs::write(&a, a_source).unwrap();
+        fs::write(&b, b_source).unwrap();
+        let mut host = AnalysisHost::default();
+        host.open(a.clone(), a_source.into());
+        let diagnostics = host.diagnostics(&a);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("a -> b -> a"));
+        assert_eq!(
+            &a_source[diagnostics[0].range.clone()],
+            "import package::b::b_value;"
+        );
     }
 
     #[test]
