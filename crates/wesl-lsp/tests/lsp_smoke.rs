@@ -1397,6 +1397,175 @@ fn pull_capable_clients_get_reports_instead_of_pushes() {
 }
 
 #[test]
+fn pull_mode_honours_disabled_diagnostics_and_requests_refresh_on_change() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("main.wesl");
+    let source = "fn main() { let value: bool = 1.0; }\n";
+    fs::write(&path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
+    let mut client = Client::start();
+
+    // A pull-capable client that also advertises refresh support and workspace.configuration,
+    // starting with diagnostics turned off.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {
+                "workspace": {"configuration": true, "diagnostics": {"refreshSupport": true}},
+                "textDocument": {"diagnostic": {"dynamicRegistration": false}}
+            },
+            "initializationOptions": {"root": root, "diagnostics": {"pull": true, "enabled": false}},
+            "rootUri": null
+        }
+    }));
+    let initialized = client.receive_response(1);
+    assert_eq!(
+        initialized["result"]["capabilities"]["diagnosticProvider"]["interFileDependencies"], true,
+        "{initialized:#?}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+    // Startup settings request: keep pull on and diagnostics off.
+    let request = client.receive();
+    assert_eq!(request["method"], "workspace/configuration");
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": request["id"].clone(),
+        "result": [{"root": root, "diagnostics": {"pull": true, "enabled": false}}]
+    }));
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {"uri": uri, "languageId": "wesl", "version": 1, "text": source}
+        }
+    }));
+
+    // Pulling while disabled must not run analysis at all: an empty full report, not the
+    // type-mismatch diagnostic the source actually contains.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let report = client.receive_response(2);
+    assert_eq!(report["result"]["kind"], "full", "{report:#?}");
+    assert_eq!(report["result"]["items"], json!([]), "{report:#?}");
+
+    // Flipping diagnostics back on must poke the client to re-pull, since a republish is a
+    // no-op in pull mode.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {}}
+    }));
+    let refresh_settings_request = loop {
+        let message = client.receive();
+        if message["method"] == "workspace/configuration" {
+            break message;
+        }
+    };
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": refresh_settings_request["id"].clone(),
+        "result": [{"root": root, "diagnostics": {"pull": true, "enabled": true}}]
+    }));
+    let refresh = client.receive();
+    assert_eq!(
+        refresh["method"], "workspace/diagnostic/refresh",
+        "a pull client advertising refreshSupport must be asked to re-pull: {refresh:#?}"
+    );
+    assert_eq!(refresh["params"], Value::Null, "{refresh:#?}");
+
+    // Closing the document in pull mode must not publish: that mechanism belongs to push mode.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didClose",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    client.send(json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}));
+    let next = client.receive();
+    assert_eq!(
+        next["id"], 3,
+        "a pull-capable client must not receive publishDiagnostics on close: {next:#?}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "exit"}));
+    client.input.take();
+    assert!(client.child.wait().unwrap().success());
+}
+
+/// `workspace/didChangeConfiguration` is broadcast for any editor setting, not just this
+/// server's, and `DiagnosticWorkspaceClientCapabilities` warns that a refresh "should be used
+/// with absolute care" since it forces a full re-pull of every open shader — so a settings
+/// round trip that changes nothing must not send one.
+#[test]
+fn pull_mode_does_not_refresh_when_settings_are_unchanged() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut client = Client::start();
+
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "capabilities": {
+                "workspace": {"configuration": true, "diagnostics": {"refreshSupport": true}},
+                "textDocument": {"diagnostic": {"dynamicRegistration": false}}
+            },
+            "initializationOptions": {"root": root, "diagnostics": {"pull": true}},
+            "rootUri": null
+        }
+    }));
+    assert_eq!(client.receive_response(1)["id"], 1);
+    client.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+    let request = client.receive();
+    assert_eq!(request["method"], "workspace/configuration");
+    let settings = json!([{"root": root, "diagnostics": {"pull": true, "enabled": true}}]);
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": request["id"].clone(),
+        "result": settings.clone()
+    }));
+
+    // An unrelated settings change round-trips with byte-identical diagnostics settings.
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {}}
+    }));
+    let second_request = loop {
+        let message = client.receive();
+        if message["method"] == "workspace/configuration" {
+            break message;
+        }
+    };
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": second_request["id"].clone(),
+        "result": settings
+    }));
+
+    // If a refresh were sent it would arrive before the shutdown response; since nothing must
+    // be sent, the very next message has to be our own shutdown reply.
+    client.send(json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}));
+    let next = client.receive();
+    assert_eq!(
+        next["id"], 99,
+        "identical settings must not trigger workspace/diagnostic/refresh: {next:#?}"
+    );
+    client.send(json!({"jsonrpc": "2.0", "method": "exit"}));
+    client.input.take();
+    assert!(client.child.wait().unwrap().success());
+}
+
+#[test]
 fn renaming_a_shader_returns_import_edits() {
     let temp = tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();

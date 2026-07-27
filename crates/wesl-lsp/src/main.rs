@@ -47,7 +47,7 @@ use lsp_types::{
         FoldingRangeRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
         OnTypeFormatting, PrepareRenameRequest, RangeFormatting, References, Rename,
         Request as RequestTrait, SelectionRangeRequest, SignatureHelpRequest, WillRenameFiles,
-        WorkspaceConfiguration, WorkspaceSymbolRequest,
+        WorkspaceConfiguration, WorkspaceDiagnosticRefresh, WorkspaceSymbolRequest,
     },
 };
 use serde::Deserialize;
@@ -109,7 +109,7 @@ impl InlayHintSettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct DiagnosticSettings {
     enabled: bool,
@@ -136,8 +136,17 @@ fn main() -> Result<()> {
     env_logger::init();
     let log_timing = std::env::args().any(|argument| argument == "--log-timing");
     let (connection, io_threads) = Connection::stdio();
-    let (initialize_id, initialize_params) = connection.initialize_start()?;
-    let initialize_params: InitializeParams = serde_json::from_value(initialize_params)?;
+    let (initialize_id, initialize_params_json) = connection.initialize_start()?;
+    // lsp-types 0.95 maps this to `workspace.diagnostic` (singular) via
+    // `DiagnosticWorkspaceClientCapabilities`, but the specification's actual JSON property is
+    // `workspace.diagnostics` (plural — see "Diagnostics Refresh" in the LSP 3.17 spec, and the
+    // frozen Zed fixture in the test suite, which sends the plural key). Reading the typed field
+    // would silently miss every real client's advertisement, so this reads the raw value instead.
+    let diagnostics_refresh_support = initialize_params_json
+        .pointer("/capabilities/workspace/diagnostics/refreshSupport")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let initialize_params: InitializeParams = serde_json::from_value(initialize_params_json)?;
     let supports_configuration = initialize_params
         .capabilities
         .workspace
@@ -226,12 +235,14 @@ fn main() -> Result<()> {
         log_timing,
         push_diagnostics: !pull_diagnostics,
         document_uris: HashMap::new(),
+        diagnostics_refresh_support,
         configuration,
         configuration_scope,
         supports_configuration,
         workspace_folders,
         encoding,
         pending_configuration: None,
+        diagnostic_refresh_requests: 0,
         shutting_down: false,
     };
     server.run()?;
@@ -254,6 +265,15 @@ fn configuration_request(id: RequestId, scope_uri: Option<Url>) -> Request {
             }],
         },
     )
+}
+
+const DIAGNOSTIC_REFRESH_REQUEST_ID: &str = "wesl-lsp/workspace-diagnostic-refresh";
+
+/// Asks a pull client to re-issue `textDocument/diagnostic` for everything it has open. Pull
+/// clients own the fetch, so this is the only way a settings change (e.g. diagnostics being
+/// switched on) reaches documents already showing a stale — or, when disabled, missing — result.
+fn workspace_diagnostic_refresh_request(id: RequestId) -> Request {
+    Request::new(id, WorkspaceDiagnosticRefresh::METHOD.to_owned(), ())
 }
 
 /// Startup-only: blocks for the response, queueing anything that arrives first so no
@@ -441,6 +461,9 @@ struct Server<'a> {
     /// re-emitting `Url::from_file_path` on the canonical path would then name a document the
     /// client never saw. This is the source of truth for URIs handed back to the client.
     document_uris: HashMap<PathBuf, Url>,
+    /// Whether the client advertised `workspace.diagnostics.refreshSupport`; gates whether
+    /// `apply_configuration` may ask a pull client to re-fetch after a settings change.
+    diagnostics_refresh_support: bool,
     configuration: Configuration,
     configuration_scope: Option<Url>,
     supports_configuration: bool,
@@ -450,6 +473,11 @@ struct Server<'a> {
     /// Set while a runtime settings refresh is in flight, so its response is recognised in
     /// the main loop rather than blocking for it.
     pending_configuration: Option<RequestId>,
+    /// Monotonically increasing counter so each `workspace/diagnostic/refresh` request gets
+    /// its own id; JSON-RPC requires ids to stay unique among concurrently outstanding
+    /// requests, and nothing obliges a client to answer promptly. See
+    /// [`Self::send_diagnostics_refresh`].
+    diagnostic_refresh_requests: u64,
     /// True between `shutdown` and `exit`, during which further requests are refused.
     shutting_down: bool,
 }
@@ -557,15 +585,55 @@ impl Server<'_> {
 
     fn apply_configuration(&mut self, configuration: Configuration) -> Result<()> {
         let root_changed = configuration.root != self.configuration.root;
+        let diagnostics_changed = configuration.diagnostics != self.configuration.diagnostics;
         self.configuration = configuration;
         if root_changed {
             // Discards every cached package, so the next request reindexes under the new root.
             self.analysis.set_roots(self.roots());
         }
+        if !self.push_diagnostics {
+            // Pull clients own the fetch; republishing does nothing for them, so the only way
+            // to reach documents already showing a stale or missing result is to ask the
+            // client to re-issue its pulls — but only when there is actually something new to
+            // pull. `DiagnosticWorkspaceClientCapabilities` warns that a refresh "should be
+            // used with absolute care", and `workspace/didChangeConfiguration` is broadcast
+            // for any editor setting, not just this server's, so sending one unconditionally
+            // would force a full re-pull of every open shader on unrelated settings churn.
+            if diagnostics_changed || root_changed {
+                self.send_diagnostics_refresh()?;
+            }
+            return Ok(());
+        }
         // Diagnostics may have been switched on or off, and a new root changes what resolves.
         for path in self.versions.keys().cloned().collect::<Vec<_>>() {
             self.publish(&path)?;
         }
+        Ok(())
+    }
+
+    /// Asks a pull client to re-issue `textDocument/diagnostic` for everything it has open; a
+    /// no-op when the client never advertised `workspace.diagnostics.refreshSupport`. Used both
+    /// after a settings change and after a watched-file event, the two ways a pull client's
+    /// already-fetched diagnostics can go stale without it asking again.
+    ///
+    /// Each call mints a fresh id rather than reusing `DIAGNOSTIC_REFRESH_REQUEST_ID` verbatim:
+    /// JSON-RPC requires ids to be unique among concurrently outstanding requests, and a client
+    /// is under no obligation to answer promptly, so two of these can easily overlap. Nothing
+    /// needs to track the id to recognise the eventual response — `run`'s `Message::Response`
+    /// arm only ever matches `pending_configuration`, so a reply to this request already falls
+    /// through unhandled, exactly as it did with the old constant id.
+    fn send_diagnostics_refresh(&mut self) -> Result<()> {
+        if !self.diagnostics_refresh_support {
+            return Ok(());
+        }
+        let id = RequestId::from(format!(
+            "{DIAGNOSTIC_REFRESH_REQUEST_ID}/{}",
+            self.diagnostic_refresh_requests
+        ));
+        self.diagnostic_refresh_requests += 1;
+        self.connection
+            .sender
+            .send(Message::Request(workspace_diagnostic_refresh_request(id)))?;
         Ok(())
     }
 
@@ -648,7 +716,11 @@ impl Server<'_> {
                 self.analysis.close(&path);
                 self.pending.remove(&path);
                 self.versions.remove(&path);
-                self.send_diagnostics(&path, Vec::new())?;
+                // Pull-only sessions never publish, so clearing here would violate the
+                // one-mechanism-per-session invariant documented above `capabilities`.
+                if self.push_diagnostics {
+                    self.send_diagnostics(&path, Vec::new())?;
+                }
                 // Removed only after the clearing publish above, so a symlinked document's
                 // last diagnostics notification still lands on the URI the client opened.
                 self.document_uris.remove(&path);
@@ -923,6 +995,24 @@ impl Server<'_> {
             DocumentDiagnosticRequest::METHOD => {
                 let params: DocumentDiagnosticParams = serde_json::from_value(request.params)?;
                 let path = uri_path(&params.text_document.uri)?;
+                if !self.configuration.diagnostics.enabled {
+                    // Mirrors `publish`'s push-mode behaviour: an empty report rather than an
+                    // error, so a client toggling diagnostics off sees them clear instead of
+                    // freeze.
+                    let report = RelatedFullDocumentDiagnosticReport {
+                        related_documents: None,
+                        full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                            result_id: None,
+                            items: Vec::new(),
+                        },
+                    };
+                    return Ok(Response::new_ok(
+                        request.id,
+                        DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+                            report,
+                        )),
+                    ));
+                }
                 let mut batch = self.analysis.diagnostic_batch(&path);
                 let items = batch
                     .iter()
