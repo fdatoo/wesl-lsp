@@ -24,19 +24,19 @@ pub struct MemberLayout {
     pub size: u32,
 }
 
-fn round_up(alignment: u32, value: u32) -> u32 {
+fn round_up(alignment: u32, value: u32) -> Option<u32> {
     if alignment == 0 {
-        return value;
+        return Some(value);
     }
-    value.div_ceil(alignment) * alignment
+    value.div_ceil(alignment).checked_mul(alignment)
 }
 
 pub fn align_of(ty: &Ty, overrides: &MemberOverrides) -> Option<u32> {
     Some(match ty {
         Ty::I32 | Ty::U32 | Ty::F32 => 4,
         Ty::F16 => 2,
-        Ty::Vector(2, element) => 2 * align_of(element, overrides)?,
-        Ty::Vector(3 | 4, element) => 4 * align_of(element, overrides)?,
+        Ty::Vector(2, element) => 2u32.checked_mul(align_of(element, overrides)?)?,
+        Ty::Vector(3 | 4, element) => 4u32.checked_mul(align_of(element, overrides)?)?,
         Ty::Matrix(_, rows, element) => align_of(&Ty::Vector(*rows, element.clone()), overrides)?,
         Ty::Array(element, _) => align_of(element, overrides)?,
         Ty::Struct(name, fields) => struct_layout(name, fields, overrides)?
@@ -52,23 +52,26 @@ pub fn size_of(ty: &Ty, overrides: &MemberOverrides) -> Option<u32> {
     Some(match ty {
         Ty::I32 | Ty::U32 | Ty::F32 => 4,
         Ty::F16 => 2,
-        Ty::Vector(size, element) => u32::from(*size) * size_of(element, overrides)?,
+        Ty::Vector(size, element) => u32::from(*size).checked_mul(size_of(element, overrides)?)?,
         Ty::Matrix(columns, rows, element) => {
             let column = Ty::Vector(*rows, element.clone());
-            u32::from(*columns)
-                * round_up(align_of(&column, overrides)?, size_of(&column, overrides)?)
+            let element_size =
+                round_up(align_of(&column, overrides)?, size_of(&column, overrides)?)?;
+            u32::from(*columns).checked_mul(element_size)?
         }
         // A runtime-sized array has no fixed footprint, so neither does anything holding it.
         Ty::Array(element, Some(count)) => {
-            *count * round_up(align_of(element, overrides)?, size_of(element, overrides)?)
+            let element_size =
+                round_up(align_of(element, overrides)?, size_of(element, overrides)?)?;
+            count.checked_mul(element_size)?
         }
         Ty::Struct(name, fields) => {
             let members = struct_layout(name, fields, overrides)?;
             let last = members.last()?;
             round_up(
                 members.iter().map(|member| member.align).max().unwrap_or(1),
-                last.offset + last.size,
-            )
+                last.offset.checked_add(last.size)?,
+            )?
         }
         _ => return None,
     })
@@ -89,15 +92,21 @@ pub fn struct_layout(
             .and_then(|list| list.get(index))
             .copied()
             .unwrap_or((None, None));
-        let align = align_attribute.unwrap_or(align_of(ty, overrides)?);
-        let size = size_attribute.unwrap_or(size_of(ty, overrides)?);
-        offset = round_up(align, offset);
+        let align = match align_attribute {
+            Some(value) => value,
+            None => align_of(ty, overrides)?,
+        };
+        let size = match size_attribute {
+            Some(value) => value,
+            None => size_of(ty, overrides)?,
+        };
+        offset = round_up(align, offset)?;
         members.push(MemberLayout {
             offset,
             align,
             size,
         });
-        offset += size;
+        offset = offset.checked_add(size)?;
     }
     (!members.is_empty()).then_some(members)
 }
@@ -258,6 +267,74 @@ mod tests {
         // And neither does a struct containing one.
         let fields = vec![("data".to_owned(), Ty::Array(Box::new(Ty::F32), None))];
         assert_eq!(struct_layout("Buffer", &fields, &empty), None);
+    }
+
+    #[test]
+    fn huge_arrays_overflow_to_no_hint_instead_of_panicking() {
+        let empty = none();
+        // 400_000_000 * 16 bytes = 6.4e9, which overflows u32 (max ~4.29e9).
+        let array = Ty::Array(Box::new(vector(4, Ty::F32)), Some(400_000_000));
+        assert_eq!(size_of(&array, &empty), None);
+
+        let fields = vec![("data".to_owned(), array)];
+        assert_eq!(struct_layout("Huge", &fields, &empty), None);
+        assert_eq!(
+            size_of(&Ty::Struct("Huge".to_owned(), fields), &empty),
+            None
+        );
+
+        // A normal struct is unaffected by the overflow checks.
+        let normal_fields = vec![
+            ("position".to_owned(), vector(3, Ty::F32)),
+            ("radius".to_owned(), Ty::F32),
+        ];
+        let normal = Ty::Struct("Sphere".to_owned(), normal_fields);
+        assert_eq!(align_of(&normal, &empty), Some(16));
+        assert_eq!(size_of(&normal, &empty), Some(16));
+    }
+
+    #[test]
+    fn accumulated_size_overrides_overflowing_the_offset_accumulator_yield_no_layout() {
+        // Two members each carrying an explicit `@size(2_147_483_648)` (2^31): the natural
+        // sizes are irrelevant, but summing the overrides into the offset accumulator still
+        // overflows u32 (2^31 + 2^31 = 2^32), which is exactly the `offset.checked_add(size)?`
+        // site the align/size rescue (finding 2) doesn't touch.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "Overflow".to_owned(),
+            vec![(None, Some(2_147_483_648)), (None, Some(2_147_483_648))],
+        );
+        let fields = vec![("a".to_owned(), Ty::F32), ("b".to_owned(), Ty::F32)];
+        assert_eq!(struct_layout("Overflow", &fields, &overrides), None);
+    }
+
+    #[test]
+    fn huge_align_override_after_a_large_offset_overflows_round_up() {
+        // The first member's `@size` pushes the offset just past a huge `@align` on the
+        // second member, so rounding the offset up to that alignment (round_up's
+        // `div_ceil(..).checked_mul(..)`) overflows u32 instead of landing on a valid offset.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "Overflow".to_owned(),
+            vec![(None, Some(3_000_000_001)), (Some(3_000_000_000), None)],
+        );
+        let fields = vec![("a".to_owned(), Ty::F32), ("b".to_owned(), Ty::F32)];
+        assert_eq!(struct_layout("Overflow", &fields, &overrides), None);
+    }
+
+    #[test]
+    fn explicit_size_rescues_a_member_whose_natural_layout_overflows() {
+        // The array's natural size (400_000_000 * 16 bytes) overflows u32 on its own — see
+        // `huge_arrays_overflow_to_no_hint_instead_of_panicking` — but an explicit `@size`
+        // makes that natural computation irrelevant, so the struct must still get a layout.
+        let mut overrides = HashMap::new();
+        overrides.insert("Rescued".to_owned(), vec![(None, Some(64))]);
+        let array = Ty::Array(Box::new(vector(4, Ty::F32)), Some(400_000_000));
+        let fields = vec![("data".to_owned(), array)];
+        let members = struct_layout("Rescued", &fields, &overrides).unwrap();
+        assert_eq!(members[0].offset, 0);
+        assert_eq!(members[0].align, 16);
+        assert_eq!(members[0].size, 64);
     }
 }
 
