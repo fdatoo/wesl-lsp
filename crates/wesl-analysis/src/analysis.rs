@@ -958,6 +958,37 @@ mod tests {
     }
 
     #[test]
+    fn inlay_hints_survive_a_truncating_change_to_an_unparseable_buffer() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("main.wesl");
+        let good = "fn main() {\n    let a = 1.0;\n    let b = 2.0;\n    let c = 3.0;\n}\n";
+        fs::write(&path, good).unwrap();
+        let mut host = AnalysisHost::new(Some(root));
+        host.open(path.clone(), good.into());
+        assert!(
+            !host
+                .inlay_hints(&path, 0..good.len(), all_hints())
+                .is_empty(),
+            "the good buffer must produce inferred-type hints for this test to mean anything"
+        );
+
+        // The reviewer's repro: shrink to an unparseable prefix. `update` keeps the stale
+        // `module` (and its OLD declaration spans, measured against `good`) while `source`
+        // moves on to this much shorter text; `inlay_hints` used to slice the new source with
+        // those old spans and panic (`start byte index N is out of bounds for string of
+        // length M`).
+        let truncated = "fn main(";
+        host.change(&path, truncated.into());
+
+        let hints = host.inlay_hints(&path, 0..truncated.len(), all_hints());
+        assert!(
+            hints.is_empty(),
+            "a stale index has no trustworthy positions left to hint from: {hints:?}"
+        );
+    }
+
+    #[test]
     fn struct_layout_hints_expose_uniform_padding() {
         use crate::InlayKind;
 

@@ -121,6 +121,13 @@ struct FileIndex {
     /// so the parsed module merges the bodies of `#ifdef` and `#else` into one contradictory
     /// picture. Navigation still works over it; type-level conclusions do not.
     dialect: bool,
+    /// Set when [`PackageIndex::update`] keeps this file's last successfully parsed
+    /// `symbols`/`locals`/`imports` because the new text failed to reparse. Those
+    /// collections still hold byte ranges measured against the OLD text even though
+    /// `source` has already moved to the new one, so any position drawn from them is
+    /// only trustworthy until the next successful reindex clears this flag. Names and
+    /// types stay usable regardless -- only positions are suspect.
+    positions_stale: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +171,16 @@ impl PackageIndex {
         if parse_str(&dialect::preprocess(&source)).is_err()
             && let Some(existing) = self.files.get_mut(&path)
         {
+            // The AST-derived `symbols`/`locals`/`imports` cannot be refreshed without a
+            // successful parse, so they are kept and flagged stale (see
+            // `FileIndex::positions_stale`) instead of dropped -- callers that only need
+            // names or types still get a useful last-good answer. `oil_imports` /
+            // `oil_definitions` / `dialect` are plain text scans with no parse
+            // dependency, so there is no reason to let them go stale too.
+            existing.oil_imports = dialect::imports(&source);
+            existing.oil_definitions = dialect::definitions(&source);
+            existing.dialect = dialect::is_naga_oil(&source);
+            existing.positions_stale = true;
             existing.source = source;
             return;
         }
@@ -185,9 +202,12 @@ impl PackageIndex {
             });
         }
         let name = identifier_at(self.files.get(path)?.source.as_ref(), offset)?;
-        self.resolve(path, &name, offset).map(|symbol| Location {
-            path: symbol.path.clone(),
-            range: symbol.range.clone(),
+        self.resolve(path, &name, offset).and_then(|symbol| {
+            let range = self.current_range(&symbol)?;
+            Some(Location {
+                path: symbol.path,
+                range,
+            })
         })
     }
 
@@ -207,16 +227,17 @@ impl PackageIndex {
             return Vec::new();
         };
         let target_key = (target.path.clone(), target.range.clone());
+        let declaration_range = self.current_range(&target);
         let mut locations = Vec::new();
-        if include_declaration {
+        if include_declaration && let Some(range) = declaration_range.clone() {
             locations.push(Location {
                 path: target.path.clone(),
-                range: target.range.clone(),
+                range,
             });
         }
         for (candidate_path, candidate) in &self.files {
             for range in identifier_ranges(&candidate.source, &name) {
-                if candidate_path == &target.path && range == target.range {
+                if candidate_path == &target.path && declaration_range.as_ref() == Some(&range) {
                     continue;
                 }
                 if self
@@ -284,13 +305,16 @@ impl PackageIndex {
             return Vec::new();
         };
         let target_key = (target.path.clone(), target.range.clone());
+        let declaration_range = (target.path == path)
+            .then(|| self.current_range(&target))
+            .flatten();
 
         let mut ranges = Vec::new();
-        if target.path == path {
-            ranges.push(target.range.clone());
+        if let Some(range) = declaration_range.clone() {
+            ranges.push(range);
         }
         for range in identifier_ranges(&file.source, &name) {
-            if target.path == path && range == target.range {
+            if declaration_range.as_ref() == Some(&range) {
                 continue;
             }
             if self
@@ -400,6 +424,7 @@ impl PackageIndex {
     pub(crate) fn document_symbols(&self, path: &Path) -> Vec<Symbol> {
         self.files
             .get(path)
+            .filter(|file| !file.positions_stale)
             .map(|file| file.symbols.clone())
             .unwrap_or_default()
     }
@@ -418,9 +443,14 @@ impl PackageIndex {
         let mut hints = Vec::new();
 
         // Type and layout hints are type-level conclusions, so they are unsound on a merged
-        // dialect module for the same reason `AnalysisHost::diagnostics` skips it. Parameter
-        // hints are name-level and stay, as does navigation.
+        // dialect module for the same reason `AnalysisHost::diagnostics` skips it. They also
+        // read spans straight out of `module`, which go stale exactly like `Symbol`/
+        // `LocalSymbol` ranges (see `FileIndex::positions_stale`) once a reparse fails --
+        // skip here too, or `find_identifier` below slices the CURRENT (possibly shorter)
+        // `file.source` with a byte range measured against the OLD one and panics. Parameter
+        // hints are token-based against the current source and stay, as does navigation.
         if let Some(module) = file.module.as_deref()
+            && !file.positions_stale
             && !file.dialect
             && (config.type_hints || config.struct_layout_hints)
         {
@@ -537,7 +567,7 @@ impl PackageIndex {
     pub(crate) fn workspace_symbols(&self, query: &str) -> Vec<WorkspaceSymbol> {
         let query = query.to_lowercase();
         let mut matches = Vec::new();
-        for file in self.files.values() {
+        for file in self.files.values().filter(|file| !file.positions_stale) {
             for symbol in &file.symbols {
                 if name_matches(&symbol.name, &query) {
                     matches.push(WorkspaceSymbol {
@@ -1048,6 +1078,48 @@ impl PackageIndex {
         path.set_extension("wgsl");
         self.files.contains_key(&path).then_some(path)
     }
+
+    /// A symbol's declaration range, valid against `symbol.path`'s CURRENT text.
+    /// `resolve` may hand back a `Symbol`/`LocalSymbol` range measured before that
+    /// file's last failed reparse (see `FileIndex::positions_stale`); returning it
+    /// verbatim would point into whatever new text now occupies those old byte offsets.
+    /// When the file is stale, re-derive the range from the identifier's occurrences in
+    /// the current text instead. That only succeeds unambiguously: with zero or
+    /// multiple occurrences of the name there is no way to tell which one used to be
+    /// the declaration, so the caller gets `None` and drops the position rather than
+    /// guessing. A single surviving occurrence is still not enough on its own: if the
+    /// edit that broke the parse deleted the declaration and left one call site behind,
+    /// that lone occurrence is a use, not a declaration, yet it would otherwise pass the
+    /// count check. Requiring it to be introduced by a declaring keyword (`fn`,
+    /// `struct`, `var`, `let`, `const`, `override`, `alias`) tells the two apart;
+    /// anything else -- a call, a type reference, a field access -- returns `None`
+    /// instead of mislabelling a use as the definition.
+    fn current_range(&self, symbol: &Symbol) -> Option<Range<usize>> {
+        let file = self.files.get(&symbol.path)?;
+        if !file.positions_stale {
+            return Some(symbol.range.clone());
+        }
+        const DECLARING_KEYWORDS: &[&str] =
+            &["fn", "struct", "var", "let", "const", "override", "alias"];
+        let name = symbol.name.as_str();
+        let all_tokens = tokens(&file.source);
+        let mut found: Option<(usize, Range<usize>)> = None;
+        for (index, (token, range)) in all_tokens.iter().enumerate() {
+            if *token != name {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some((index, range.clone()));
+        }
+        let (index, range) = found?;
+        let declares = index
+            .checked_sub(1)
+            .and_then(|previous| all_tokens.get(previous))
+            .is_some_and(|(token, _)| DECLARING_KEYWORDS.contains(token));
+        declares.then_some(range)
+    }
 }
 
 const KEYWORD_COMPLETIONS: &[(&str, &str)] = &[
@@ -1170,6 +1242,7 @@ impl FileIndex {
                 oil_imports,
                 oil_definitions,
                 dialect,
+                positions_stale: false,
             };
         };
         let symbols = index_symbols(&path, &source, &module);
@@ -1185,6 +1258,7 @@ impl FileIndex {
             oil_imports,
             oil_definitions,
             dialect,
+            positions_stale: false,
         }
     }
 }
@@ -1775,7 +1849,7 @@ fn is_builtin(name: &str) -> bool {
 mod tests {
     use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-    use super::{FileIndex, declared_type_name, member_base_source};
+    use super::{FileIndex, PackageIndex, declared_type_name, member_base_source};
     use crate::ty::{Ty, TypeEnvironment, infer_expression_type};
 
     #[test]
@@ -1797,5 +1871,117 @@ mod tests {
             TypeEnvironment::default(),
         );
         assert_eq!(ty, Ty::Vector(3, Box::new(Ty::F32)));
+    }
+
+    #[test]
+    fn rename_after_failed_reparse_never_touches_stale_ranges() {
+        let root = PathBuf::from("/virtual/rename-stale");
+        let path = root.join("shader.wesl");
+        let good = "fn double(x: f32) -> f32 { return x * 2.0; }\nfn use_double() -> f32 { return double(3.0); }\n";
+        let overlays = HashMap::from([(path.clone(), Arc::<str>::from(good))]);
+        let mut package = PackageIndex::build(root, &overlays);
+
+        // Prepending and appending text shifts every byte offset the first parse
+        // recorded, and the appended `fn half(` is unterminated, so this reparse fails
+        // -- the review's repro: the index keeps `double`'s OLD declaration range
+        // (3..9) while `source` moves on to text where those same bytes now spell
+        // "pad\nfn".
+        let edited = format!("// pad\n{good}fn half(");
+        assert_eq!(&edited[3..9], "pad\nfn");
+        package.update(path.clone(), Arc::from(edited.clone()));
+
+        let offset = edited.find("double").unwrap() + 1;
+        let edits = package
+            .rename(&path, offset, "triple")
+            .expect("double is a renameable, non-builtin identifier");
+
+        assert_eq!(
+            edits.len(),
+            2,
+            "the declaration and the one call site: {edits:#?}"
+        );
+        for edit in &edits {
+            assert_eq!(edit.path, path);
+            assert_eq!(
+                &edited[edit.range.clone()],
+                "double",
+                "every renamed range must literally spell the identifier in CURRENT text"
+            );
+            assert_ne!(
+                edit.range,
+                3..9,
+                "must not reuse the stale pre-reparse declaration range"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_file_declaration_positions_are_recovered_or_omitted() {
+        let root = PathBuf::from("/virtual/definition-stale");
+        let path = root.join("shader.wesl");
+        let good = "fn solo(x: f32) -> f32 { return x * 2.0; }\n";
+        let overlays = HashMap::from([(path.clone(), Arc::<str>::from(good))]);
+        let mut package = PackageIndex::build(root, &overlays);
+
+        let edited = format!("// pad\n{good}fn half(");
+        package.update(path.clone(), Arc::from(edited.clone()));
+
+        // `solo` appears exactly once in the file, so the declaration range is
+        // unambiguously recoverable from current text even though the index is stale.
+        let fresh_offset = edited.find("solo").unwrap() + 1;
+        let location = package
+            .definition(&path, fresh_offset)
+            .expect("solo still resolves to its own (stale-index) declaration");
+        assert_eq!(location.path, path);
+        assert_eq!(&edited[location.range.clone()], "solo");
+        assert_ne!(
+            location.range,
+            3..7,
+            "must not reuse the stale pre-reparse declaration range"
+        );
+
+        // Bulk listing endpoints have no way to re-derive a whole symbol tree without a
+        // parse, so they drop stale files outright rather than surface any of their
+        // ranges.
+        assert!(package.document_symbols(&path).is_empty());
+        assert!(package.workspace_symbols("solo").is_empty());
+    }
+
+    #[test]
+    fn current_range_does_not_promote_a_surviving_call_site_to_a_declaration() {
+        let root = PathBuf::from("/virtual/deleted-declaration");
+        let path = root.join("shader.wesl");
+        let good = "fn helper() -> f32 { return 1.0; }\nfn main() -> f32 { return helper(); }\n";
+        let overlays = HashMap::from([(path.clone(), Arc::<str>::from(good))]);
+        let mut package = PackageIndex::build(root, &overlays);
+
+        let declaration_offset = good.find("helper").unwrap() + 1;
+        assert!(
+            package.definition(&path, declaration_offset).is_some(),
+            "the declaration must resolve before the edit"
+        );
+
+        // Deletes `helper`'s declaration outright and leaves the brace unterminated, so the
+        // reparse fails -- the reviewer's repro. `helper` now occurs exactly once in the
+        // text (the call), which used to be enough for `current_range`'s exactly-once rule
+        // to (wrongly) hand it back as the declaration.
+        let edited = "fn main() -> f32 { return helper(); ";
+        package.update(path.clone(), Arc::from(edited));
+
+        let call_offset = edited.find("helper").unwrap() + 1;
+        assert!(
+            package.definition(&path, call_offset).is_none(),
+            "a lone call site must not be promoted to a declaration"
+        );
+
+        // The call site is still a legitimate reference -- it just cannot masquerade as
+        // the declaration entry.
+        let references = package.references(&path, call_offset, true);
+        assert_eq!(
+            references.len(),
+            1,
+            "the call site itself, and nothing claiming to be the declaration: {references:#?}"
+        );
+        assert_eq!(&edited[references[0].range.clone()], "helper");
     }
 }
