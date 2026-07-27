@@ -213,9 +213,33 @@ impl Drop for Client {
     }
 }
 
+/// With `WESL_LSP_REQUIRE_CORPORA` set to a non-empty value other than `"0"`, a missing corpus
+/// fails instead of skipping.
+///
+/// Every corpus gate returns early when its input is absent, which means a half-successful
+/// `fetch-corpus` turns the whole suite green while proving nothing. CI sets this so that
+/// silence becomes a failure. `var_os(..).is_some()` would treat an *empty* override as "set",
+/// but CI's skip-mode step exports `WESL_LSP_REQUIRE_CORPORA: ""` expecting that to mean off
+/// (GitHub Actions exports empty-valued env vars rather than unsetting them), so empty and
+/// `"0"` both count as off here.
+fn require_corpora() -> bool {
+    std::env::var("WESL_LSP_REQUIRE_CORPORA").is_ok_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Reads the Seclorum shader corpus root from `WESL_LSP_SECLORUM_SHADERS` if set, so the one
+/// end-to-end pass over definition/references/rename/documentSymbol/hover/completion is not
+/// wired to one machine's checkout layout. Falls back to the relative path used on the
+/// machine this was written on; the caller's `is_dir()` check skips the test either way when
+/// neither exists. Canonicalized because the URL parser strips `..` segments on the wire:
+/// a dotted path would make `receive_diagnostics`'s verbatim URI comparison unsatisfiable.
 fn shaders() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Seclorum/novus/crates/novus-render/shaders")
+    let root = std::env::var_os("WESL_LSP_SECLORUM_SHADERS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../Seclorum/novus/crates/novus-render/shaders")
+        });
+    root.canonicalize().unwrap_or(root)
 }
 
 fn position(source: &str, offset: usize) -> Value {
@@ -424,6 +448,12 @@ fn struct_members_complete_reference_and_clear_diagnostics() {
 fn publishes_clean_then_isolated_import_diagnostics() {
     let shader_root = shaders();
     if !shader_root.is_dir() {
+        assert!(
+            !require_corpora(),
+            "Seclorum shader corpus missing at {}; set WESL_LSP_SECLORUM_SHADERS to the \
+             checkout (WESL_LSP_REQUIRE_CORPORA unset or \"0\" skips this check)",
+            shader_root.display()
+        );
         eprintln!("skipping private Seclorum LSP smoke test");
         return;
     }

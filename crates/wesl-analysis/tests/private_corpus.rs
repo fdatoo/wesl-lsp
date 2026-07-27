@@ -8,6 +8,7 @@ fn private_corpus_has_no_false_diagnostics() {
         return;
     };
     let mut failures = Vec::new();
+    let mut processed = 0;
     for entry in fs::read_dir(&root).unwrap().filter_map(Result::ok) {
         let path = entry.path();
         if !matches!(
@@ -23,6 +24,11 @@ fn private_corpus_has_no_false_diagnostics() {
         if !diagnostics.is_empty() {
             failures.push((path, diagnostics));
         }
+        processed += 1;
     }
     assert!(failures.is_empty(), "{failures:#?}");
+    assert!(
+        processed >= 20,
+        "only processed {processed} private shaders; check WESL_LSP_PRIVATE_CORPUS"
+    );
 }

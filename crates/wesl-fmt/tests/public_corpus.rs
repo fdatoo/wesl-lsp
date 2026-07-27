@@ -2,13 +2,17 @@ use std::{fs, path::PathBuf};
 
 use walkdir::WalkDir;
 
-/// With `WESL_LSP_REQUIRE_CORPORA` set, a missing corpus fails instead of skipping.
+/// With `WESL_LSP_REQUIRE_CORPORA` set to a non-empty value other than `"0"`, a missing corpus
+/// fails instead of skipping.
 ///
 /// Every corpus gate returns early when its input is absent, which means a half-successful
 /// `fetch-corpus` turns the whole suite green while proving nothing. CI sets this so that
-/// silence becomes a failure.
+/// silence becomes a failure. `var_os(..).is_some()` would treat an *empty* override as "set",
+/// but CI's skip-mode step exports `WESL_LSP_REQUIRE_CORPORA: ""` expecting that to mean off
+/// (GitHub Actions exports empty-valued env vars rather than unsetting them), so empty and
+/// `"0"` both count as off here.
 fn require_corpora() -> bool {
-    std::env::var_os("WESL_LSP_REQUIRE_CORPORA").is_some()
+    std::env::var("WESL_LSP_REQUIRE_CORPORA").is_ok_and(|value| !value.is_empty() && value != "0")
 }
 
 #[test]

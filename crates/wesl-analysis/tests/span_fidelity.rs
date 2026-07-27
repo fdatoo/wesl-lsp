@@ -234,7 +234,15 @@ impl<'a> SpanProbe<'a> {
 
 fn terrain_path() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("WESL_LSP_PRIVATE_CORPUS") {
-        return Some(PathBuf::from(root).join("terrain.wesl"));
+        let candidate = PathBuf::from(root).join("terrain.wesl");
+        // Unlike the fallback path below, the operator explicitly pointed us here, so a
+        // missing file is a misconfiguration to report, not a reason to skip quietly.
+        assert!(
+            candidate.exists(),
+            "WESL_LSP_PRIVATE_CORPUS is set but {} is missing",
+            candidate.display()
+        );
+        return Some(candidate);
     }
     let local = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../Seclorum/novus/crates/novus-render/shaders/terrain.wesl");

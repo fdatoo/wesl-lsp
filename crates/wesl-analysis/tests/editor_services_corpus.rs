@@ -12,11 +12,12 @@ use std::{fs, path::PathBuf};
 use walkdir::WalkDir;
 use wesl_analysis::{AnalysisHost, InlayHintConfig, folding_ranges, selection_ranges};
 
+#[path = "common/mod.rs"]
+mod common;
+
 fn corpus_shaders(limit: usize) -> Vec<(PathBuf, String)> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
-    if !root.exists() {
-        return Vec::new();
-    }
+    // Callers already gate on `common::corpus_root().exists()` before calling this.
+    let root = common::corpus_root();
     let mut shaders = WalkDir::new(&root)
         .into_iter()
         .filter_map(Result::ok)
@@ -70,10 +71,16 @@ const MAX_PROBES_PER_FILE: usize = 200;
 
 #[test]
 fn purely_textual_services_survive_every_corpus_offset() {
-    let shaders = corpus_shaders(usize::MAX);
-    if shaders.is_empty() {
+    let root = common::corpus_root();
+    if !root.exists() {
+        assert!(
+            !common::require_corpora(),
+            "corpus missing at {}; run `cargo run -p xtask -- fetch-corpus`",
+            root.display()
+        );
         return;
     }
+    let shaders = corpus_shaders(usize::MAX);
     let mut probed = 0;
     for (path, source) in &shaders {
         // Folding is per-document; every range must be in bounds and non-empty.
@@ -119,8 +126,13 @@ fn purely_textual_services_survive_every_corpus_offset() {
 
 #[test]
 fn host_backed_services_survive_every_corpus_offset() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+    let root = common::corpus_root();
     if !root.exists() {
+        assert!(
+            !common::require_corpora(),
+            "corpus missing at {}; run `cargo run -p xtask -- fetch-corpus`",
+            root.display()
+        );
         return;
     }
     // One host per corpus package, matching how an editor holds a single host across a

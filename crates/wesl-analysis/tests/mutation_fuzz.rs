@@ -17,6 +17,9 @@ use wesl_analysis::{
     selection_ranges,
 };
 
+#[path = "common/mod.rs"]
+mod common;
+
 /// xorshift64*, so the corpus sweep is reproducible without a dependency.
 struct Rng(u64);
 
@@ -104,10 +107,8 @@ fn probe_offsets(source: &str, limit: usize) -> Vec<usize> {
 }
 
 fn seed_shaders(limit: usize) -> Vec<(PathBuf, String)> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
-    if !root.exists() {
-        return Vec::new();
-    }
+    // Callers already gate on `common::corpus_root().exists()` before calling this.
+    let root = common::corpus_root();
     let mut shaders = WalkDir::new(&root)
         .into_iter()
         .filter_map(Result::ok)
@@ -132,10 +133,16 @@ fn seed_shaders(limit: usize) -> Vec<(PathBuf, String)> {
 
 #[test]
 fn textual_services_survive_damaged_shaders() {
-    let shaders = seed_shaders(60);
-    if shaders.is_empty() {
+    let root = common::corpus_root();
+    if !root.exists() {
+        assert!(
+            !common::require_corpora(),
+            "corpus missing at {}; run `cargo run -p xtask -- fetch-corpus`",
+            root.display()
+        );
         return;
     }
+    let shaders = seed_shaders(60);
     let mut rounds = 0;
     for (path, source) in &shaders {
         for seed in 1..12u64 {
@@ -177,10 +184,16 @@ fn textual_services_survive_damaged_shaders() {
 
 #[test]
 fn host_services_survive_damaged_shaders() {
-    let shaders = seed_shaders(25);
-    if shaders.is_empty() {
+    let root = common::corpus_root();
+    if !root.exists() {
+        assert!(
+            !common::require_corpora(),
+            "corpus missing at {}; run `cargo run -p xtask -- fetch-corpus`",
+            root.display()
+        );
         return;
     }
+    let shaders = seed_shaders(25);
     let mut rounds = 0;
     for (path, source) in &shaders {
         for seed in 1..6u64 {
@@ -215,10 +228,17 @@ fn host_services_survive_damaged_shaders() {
 /// a mangled buffer is exactly when a client sends a position the server did not expect.
 #[test]
 fn positions_stay_sane_on_damaged_shaders() {
-    let shaders = seed_shaders(30);
-    if shaders.is_empty() {
+    let root = common::corpus_root();
+    if !root.exists() {
+        assert!(
+            !common::require_corpora(),
+            "corpus missing at {}; run `cargo run -p xtask -- fetch-corpus`",
+            root.display()
+        );
         return;
     }
+    let shaders = seed_shaders(30);
+    let mut round_trips = 0;
     for (_, source) in &shaders {
         for seed in 1..8u64 {
             let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
@@ -234,8 +254,13 @@ fn positions_stay_sane_on_damaged_shaders() {
                         Some(offset),
                         "seed {seed}, {encoding:?}: position round trip failed at {offset}"
                     );
+                    round_trips += 1;
                 }
             }
         }
     }
+    assert!(
+        round_trips >= 5_000,
+        "only checked {round_trips} position round trips"
+    );
 }

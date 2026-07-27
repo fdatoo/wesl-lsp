@@ -11,6 +11,9 @@ use wgsl_parse::{
     syntax::{ModulePath, PathOrigin},
 };
 
+#[path = "common/mod.rs"]
+mod common;
+
 const NAGA_LAG_EXCEPTIONS: &[&str] = &[
     "wesl-rs/crates/wesl-test/wgpu/out/glsl-expressions.frag.wgsl",
     "wesl-rs/crates/wesl-test/wgpu/out/glsl-samplers.frag.wgsl",
@@ -30,8 +33,13 @@ const NON_TYPE_OR_COMPOSED_EXCEPTIONS: &[&str] = &[
 
 #[test]
 fn public_corpus_matches_naga_bidirectionally() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+    let root = common::corpus_root();
     if !root.exists() {
+        assert!(
+            !common::require_corpora(),
+            "corpus missing at {}; run `cargo run -p xtask -- fetch-corpus`",
+            root.display()
+        );
         return;
     }
     let mut compared = 0;
@@ -88,13 +96,19 @@ fn private_corpus_matches_naga_bidirectionally() {
     let Some(root) = env::var_os("WESL_LSP_PRIVATE_CORPUS").map(PathBuf::from) else {
         return;
     };
+    let mut compared = 0;
     for entry in fs::read_dir(&root).unwrap().filter_map(Result::ok) {
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("wesl") {
             continue;
         }
         check_clean_file(&root, &path);
+        compared += 1;
     }
+    assert!(
+        compared >= 20,
+        "only compared {compared} private shaders; check WESL_LSP_PRIVATE_CORPUS"
+    );
 }
 
 #[test]
