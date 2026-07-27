@@ -2,16 +2,107 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::Duration,
 };
 
 use serde_json::{Value, json};
 
 use tempfile::tempdir;
+
+/// Long enough for a cold package index on a large workspace, short enough that a wedged
+/// server fails the run instead of hanging the whole suite.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Distinguishes a clean end of stream (`Eof`, which the reader thread folds into simply
+/// exiting, so `Client::receive` sees `RecvTimeoutError::Disconnected`) from a malformed
+/// message (`Protocol`), which the thread instead posts to the channel as a sentinel before
+/// exiting — see `Client::start`. Without this distinction a crashing server's truncated
+/// output looked identical to a clean shutdown, and `Client::receive` reported a misleading
+/// "no message within 30s" instead of the real cause.
+#[derive(Debug)]
+enum ReadError {
+    Eof,
+    Protocol(String),
+}
+
+fn read_message(reader: &mut impl BufRead) -> Result<Value, ReadError> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|error| ReadError::Protocol(format!("failed to read header: {error}")))?;
+        if bytes == 0 {
+            return Err(ReadError::Eof);
+        }
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length: ") {
+            content_length = Some(value.trim().parse::<usize>().map_err(|error| {
+                ReadError::Protocol(format!("malformed Content-Length {value:?}: {error}"))
+            })?);
+        }
+    }
+    let content_length = content_length
+        .ok_or_else(|| ReadError::Protocol("header block had no Content-Length".to_owned()))?;
+    let mut body = vec![0; content_length];
+    Read::read_exact(reader, &mut body).map_err(|error| {
+        ReadError::Protocol(format!(
+            "short body (wanted {content_length} bytes): {error}"
+        ))
+    })?;
+    serde_json::from_slice(&body)
+        .map_err(|error| ReadError::Protocol(format!("non-JSON body: {error}")))
+}
+
+#[test]
+fn read_message_distinguishes_eof_from_protocol_errors() {
+    use std::io::Cursor;
+
+    // Nothing was ever written: a clean end of stream, not a protocol error.
+    assert!(matches!(
+        read_message(&mut Cursor::new(b"".as_slice())),
+        Err(ReadError::Eof)
+    ));
+
+    // A header block whose Content-Length value doesn't parse.
+    assert!(matches!(
+        read_message(&mut Cursor::new(
+            b"Content-Length: not-a-number\r\n\r\n".as_slice()
+        )),
+        Err(ReadError::Protocol(_))
+    ));
+
+    // Content-Length overstates what actually follows.
+    assert!(matches!(
+        read_message(&mut Cursor::new(b"Content-Length: 10\r\n\r\n{}".as_slice())),
+        Err(ReadError::Protocol(_))
+    ));
+
+    // A body of exactly the promised length that still isn't valid JSON.
+    assert!(matches!(
+        read_message(&mut Cursor::new(b"Content-Length: 3\r\n\r\nabc".as_slice())),
+        Err(ReadError::Protocol(_))
+    ));
+
+    // A well-formed message still parses despite the stricter error type.
+    let body = br#"{"jsonrpc":"2.0","method":"ping"}"#;
+    let mut framed = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    framed.extend_from_slice(body);
+    assert_eq!(
+        read_message(&mut Cursor::new(framed.as_slice())).unwrap(),
+        json!({"jsonrpc": "2.0", "method": "ping"})
+    );
+}
+
 struct Client {
     child: Child,
     input: Option<ChildStdin>,
-    output: BufReader<ChildStdout>,
+    incoming: mpsc::Receiver<Result<Value, String>>,
 }
 
 impl Client {
@@ -22,11 +113,30 @@ impl Client {
             .spawn()
             .unwrap();
         let input = child.stdin.take().unwrap();
-        let output = BufReader::new(child.stdout.take().unwrap());
+        let stdout = child.stdout.take().unwrap();
+        // Reading on a thread keeps a wedged server from hanging the whole run.
+        let (sender, incoming) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                match read_message(&mut reader) {
+                    Ok(message) => {
+                        if sender.send(Ok(message)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(ReadError::Eof) => break,
+                    Err(ReadError::Protocol(error)) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
         Self {
             child,
             input: Some(input),
-            output,
+            incoming,
         }
     }
 
@@ -43,24 +153,16 @@ impl Client {
     }
 
     fn receive(&mut self) -> Value {
-        let mut content_length = None;
-        loop {
-            let mut line = String::new();
-            assert_ne!(
-                self.output.read_line(&mut line).unwrap(),
-                0,
-                "server closed stdout"
-            );
-            if line == "\r\n" {
-                break;
+        match self.incoming.recv_timeout(REPLY_TIMEOUT) {
+            Ok(Ok(message)) => message,
+            Ok(Err(protocol_error)) => {
+                panic!("server produced a malformed message: {protocol_error}")
             }
-            if let Some(length) = line.strip_prefix("Content-Length: ") {
-                content_length = Some(length.trim().parse::<usize>().unwrap());
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("server closed stdout"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("server produced no message within {REPLY_TIMEOUT:?}")
             }
         }
-        let mut body = vec![0; content_length.unwrap()];
-        self.output.read_exact(&mut body).unwrap();
-        serde_json::from_slice(&body).unwrap()
     }
 
     fn receive_response(&mut self, id: i64) -> Value {
