@@ -610,8 +610,9 @@ impl Server<'_> {
                     apply_content_changes(before, &params.content_changes, self.encoding);
                 if rejected > 0 {
                     log::warn!(
-                        "ignored {rejected} out-of-range change(s) for {}; the buffer may be \
-                         stale until the next save",
+                        "ignored {rejected} malformed change(s) for {}; a position landing \
+                         mid-character has no addressable offset, so the buffer may be stale \
+                         until the next save",
                         path.display()
                     );
                 }
@@ -1262,8 +1263,10 @@ fn completion_item(
 /// A ranged change is incremental, so both endpoints resolve against the text as it stands
 /// immediately before that change — not against the original. Getting this wrong desynchronises
 /// the server's buffer from the editor's silently: no error is raised, every later answer is
-/// computed against the wrong text, and only a save resynchronises. An out-of-range change is
-/// skipped rather than guessed at, for the same reason.
+/// computed against the wrong text, and only a save resynchronises. Out-of-range endpoints
+/// clamp to the document per the LSP `Position` spec instead of being rejected; a change is
+/// counted as rejected only when an endpoint is genuinely unaddressable — a column landing
+/// mid-character or mid-surrogate-pair, which has no offset to clamp to in the first place.
 fn apply_content_changes(
     before: &str,
     changes: &[TextDocumentContentChangeEvent],
@@ -1626,9 +1629,12 @@ mod tests {
         assert_eq!(rejected, 0);
     }
 
-    /// An unresolvable range must be skipped and counted, never silently mis-applied.
+    /// Out-of-range positions clamp per the LSP `Position` spec ("character greater than the
+    /// line length defaults back to the line length"), so a spec-legal oversized range applies
+    /// instead of silently desynchronising the buffer. Only a genuinely malformed position —
+    /// one landing mid-character — is skipped and counted.
     #[test]
-    fn out_of_range_changes_are_rejected_not_guessed() {
+    fn out_of_range_changes_clamp_and_malformed_ones_are_rejected() {
         let source = "fn main() {}\n";
         let beyond = TextDocumentContentChangeEvent {
             range: Some(LspRange::new(
@@ -1643,14 +1649,50 @@ mod tests {
             std::slice::from_ref(&beyond),
             PositionEncoding::Utf16,
         );
-        assert_eq!(text, source, "buffer must be left untouched");
-        assert_eq!(rejected, 1);
+        assert_eq!(
+            text, "fn main() {}\nx",
+            "line past EOF clamps to document end"
+        );
+        assert_eq!(rejected, 0);
 
-        // A surviving change in the same batch still applies.
-        let good = change(source, 0..2, "FN", PositionEncoding::Utf16);
+        // A character past the end of a line that *does* exist clamps to that line's content
+        // rather than past its newline — a distinct code path from the line-past-EOF case
+        // above, which takes `position_to_offset`'s other early return. Getting this wrong
+        // would silently swallow the newline and merge two lines.
+        let past_line_end = TextDocumentContentChangeEvent {
+            range: Some(LspRange::new(
+                LspPosition::new(0, 5),
+                LspPosition::new(0, 99),
+            )),
+            range_length: None,
+            text: "X".to_owned(),
+        };
+        let (text, rejected) = apply_content_changes(
+            source,
+            std::slice::from_ref(&past_line_end),
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(
+            text, "fn maX\n",
+            "character past a valid line's end clamps to the line, not into the newline"
+        );
+        assert_eq!(rejected, 0);
+
+        // A UTF-8 column landing inside a multi-byte character is unaddressable: skipped and
+        // counted, with the buffer left untouched, and a later change in the batch still applies.
+        let emoji = "😀ok\n";
+        let malformed = TextDocumentContentChangeEvent {
+            range: Some(LspRange::new(
+                LspPosition::new(0, 1),
+                LspPosition::new(0, 2),
+            )),
+            range_length: None,
+            text: "x".to_owned(),
+        };
+        let good = change(emoji, 4..6, "OK", PositionEncoding::Utf8);
         let (text, rejected) =
-            apply_content_changes(source, &[beyond, good], PositionEncoding::Utf16);
-        assert_eq!(text, "FN main() {}\n");
+            apply_content_changes(emoji, &[malformed, good], PositionEncoding::Utf8);
+        assert_eq!(text, "😀OK\n");
         assert_eq!(rejected, 1);
     }
 

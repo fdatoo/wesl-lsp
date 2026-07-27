@@ -51,22 +51,48 @@ impl LineIndex {
         })
     }
 
+    /// Converts an LSP position to a byte offset in `source`.
+    ///
+    /// Out-of-range positions are clamped rather than rejected, matching the LSP spec: a
+    /// `character` past the end of its line clamps to the line end, and a `line` past the
+    /// last line clamps to the end of the document. `None` is reserved for a position that is
+    /// genuinely malformed — a column landing inside a multi-byte UTF-8 character or a
+    /// UTF-16 surrogate pair, which has no addressable byte offset.
     pub fn position_to_offset(&self, source: &str, position: Position) -> Option<usize> {
-        let line_start = *self.line_starts.get(position.line as usize)?;
-        let line_end = self
-            .line_starts
-            .get(position.line as usize + 1)
-            .copied()
-            .map_or(source.len(), |next| next.saturating_sub(1));
+        let Some(&line_start) = self.line_starts.get(position.line as usize) else {
+            // No such line: clamp to end of document rather than rejecting.
+            return Some(source.len());
+        };
+        let next_line_start = self.line_starts.get(position.line as usize + 1).copied();
+        let line_end = next_line_start.map_or(source.len(), |next| next.saturating_sub(1));
+        // `line_end` is the index of the line terminator (`\n` when a next line exists).
+        // On a CRLF document that index still includes the preceding `\r`, so clamping an
+        // oversized character straight to `line_end` would land the offset inside the
+        // two-byte terminator; `apply_content_changes` would then consume the `\r` but
+        // leave the `\n` behind, silently desyncing the buffer from the client. The LSP
+        // spec's line length excludes the terminator, so strip a trailing `\r` from the
+        // clamp target here — both encoding branches below share this single value so they
+        // can't disagree with each other.
+        let content_end = if next_line_start.is_some()
+            && source.as_bytes().get(line_end.wrapping_sub(1)) == Some(&b'\r')
+        {
+            line_end - 1
+        } else {
+            line_end
+        };
         let target = position.character as usize;
 
         if self.encoding == PositionEncoding::Utf8 {
             let offset = line_start + target;
-            // Still validated: a column past the line, or mid-character, is not addressable.
-            return (offset <= line_end && source.is_char_boundary(offset)).then_some(offset);
+            if offset >= content_end {
+                // Character past the line (or exactly at its end) clamps to the line end.
+                return Some(content_end);
+            }
+            // A column landing inside a multi-byte character is still rejected as malformed.
+            return source.is_char_boundary(offset).then_some(offset);
         }
 
-        let line = &source[line_start..line_end];
+        let line = &source[line_start..content_end];
         let mut utf16_col = 0;
         for (byte_offset, ch) in line.char_indices() {
             if utf16_col == target {
@@ -74,10 +100,12 @@ impl LineIndex {
             }
             utf16_col += ch.len_utf16();
             if utf16_col > target {
+                // Landed inside a surrogate pair: genuinely malformed, not just out of range.
                 return None;
             }
         }
-        (utf16_col == target).then_some(line_end)
+        // Ran out of line before reaching the target column: clamp to the line end.
+        Some(content_end)
     }
 }
 
@@ -161,6 +189,137 @@ mod tests {
                 },
             ),
             None
+        );
+    }
+
+    #[test]
+    fn position_to_offset_clamps_out_of_range_character_and_line() {
+        let source = "a😀b\néx";
+        let line_end = source.find('\n').unwrap();
+        let doc_end = source.len();
+
+        // A character far past the end of a line clamps to that line's end, per the LSP spec,
+        // rather than being rejected as if it were malformed.
+        let utf8_index = LineIndex::new(source, PositionEncoding::Utf8);
+        assert_eq!(
+            utf8_index.position_to_offset(
+                source,
+                Position {
+                    line: 0,
+                    character: 999,
+                },
+            ),
+            Some(line_end)
+        );
+        let utf16_index = LineIndex::new(source, PositionEncoding::Utf16);
+        assert_eq!(
+            utf16_index.position_to_offset(
+                source,
+                Position {
+                    line: 0,
+                    character: 999,
+                },
+            ),
+            Some(line_end)
+        );
+
+        // A line far past the last line clamps to the end of the document.
+        assert_eq!(
+            utf8_index.position_to_offset(
+                source,
+                Position {
+                    line: 999,
+                    character: 0,
+                },
+            ),
+            Some(doc_end)
+        );
+        assert_eq!(
+            utf16_index.position_to_offset(
+                source,
+                Position {
+                    line: 999,
+                    character: 999,
+                },
+            ),
+            Some(doc_end)
+        );
+
+        // Mid-character columns remain genuinely malformed, not merely out of range.
+        assert_eq!(
+            utf8_index.position_to_offset(
+                source,
+                Position {
+                    line: 0,
+                    character: 3,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            utf16_index.position_to_offset(
+                source,
+                Position {
+                    line: 0,
+                    character: 2,
+                },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn position_to_offset_clamps_crlf_before_the_terminator() {
+        // "ab\r\ncd": line 0 is "ab", terminated by "\r\n" at bytes 2-3, line 1 starts at byte 4.
+        let source = "ab\r\ncd";
+
+        // A character far past the end of a CRLF-terminated line clamps to the content end
+        // (offset 2, right after "ab"), not to the index of the "\n" (offset 3) — landing
+        // there would leave the clamp inside the two-byte terminator and let
+        // `apply_content_changes` consume the "\r" while leaving the "\n" behind.
+        let utf8_index = LineIndex::new(source, PositionEncoding::Utf8);
+        assert_eq!(
+            utf8_index.position_to_offset(
+                source,
+                Position {
+                    line: 0,
+                    character: 999,
+                },
+            ),
+            Some(2)
+        );
+        let utf16_index = LineIndex::new(source, PositionEncoding::Utf16);
+        assert_eq!(
+            utf16_index.position_to_offset(
+                source,
+                Position {
+                    line: 0,
+                    character: 999,
+                },
+            ),
+            Some(2)
+        );
+
+        // The clamped offset round-trips back to the same position in both encodings.
+        let clamped = Position {
+            line: 0,
+            character: 2,
+        };
+        assert_eq!(utf8_index.offset_to_position(source, 2), Some(clamped));
+        assert_eq!(utf16_index.offset_to_position(source, 2), Some(clamped));
+
+        // LF-only documents are unaffected: the clamp still lands on the index of "\n".
+        let lf_source = "ab\ncd";
+        let lf_index = LineIndex::new(lf_source, PositionEncoding::Utf8);
+        assert_eq!(
+            lf_index.position_to_offset(
+                lf_source,
+                Position {
+                    line: 0,
+                    character: 999,
+                },
+            ),
+            Some(2)
         );
     }
 }
