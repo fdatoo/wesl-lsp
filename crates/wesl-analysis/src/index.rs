@@ -710,13 +710,16 @@ impl PackageIndex {
         }
 
         let insertion = import_insertion_offset(&file.source);
-        for (candidate_path, candidate) in &self.files {
+        let mut candidate_paths: Vec<&PathBuf> = self.files.keys().collect();
+        candidate_paths.sort();
+        for candidate_path in candidate_paths {
             if candidate_path == path {
                 continue;
             }
             let Some(module) = module_name(&self.root, candidate_path) else {
                 continue;
             };
+            let candidate = &self.files[candidate_path];
             for symbol in &candidate.symbols {
                 if seen.contains(symbol.name.as_str()) {
                     continue;
@@ -1118,12 +1121,21 @@ impl PackageIndex {
         None
     }
 
+    /// The lexicographically-first file (by path) defining `import`, so that when two
+    /// files in the package both `#define_import_path` the same name the winner is
+    /// deterministic rather than whichever `HashMap` iteration happened to visit first.
+    /// One pass over `self.files` with no allocation: filter down to the files that
+    /// actually define `import`, then take the minimum by path -- the same answer a
+    /// sort-then-take-first would give, without the sort.
     fn oil_definition(&self, import: &str) -> Option<(&PathBuf, &Range<usize>)> {
-        self.files.iter().find_map(|(path, file)| {
-            file.oil_definitions
-                .iter()
-                .find_map(|(definition, range)| (definition == import).then_some((path, range)))
-        })
+        self.files
+            .iter()
+            .filter_map(|(path, file)| {
+                file.oil_definitions
+                    .iter()
+                    .find_map(|(definition, range)| (definition == import).then_some((path, range)))
+            })
+            .min_by(|left, right| left.0.cmp(right.0))
     }
 
     fn module_file(&self, module: &ModulePath) -> Option<PathBuf> {
@@ -2100,5 +2112,45 @@ mod tests {
             DEPTH,
             "a second request must not recompute anything the first one already cached"
         );
+    }
+
+    #[test]
+    fn auto_import_completion_picks_the_same_module_across_rebuilds() {
+        let root = PathBuf::from("/virtual/determinism");
+        let a_path = root.join("a_impl.wesl");
+        let z_path = root.join("z_impl.wesl");
+        let user_path = root.join("user.wesl");
+        // `helper`, not `shared` -- the latter is a reserved WGSL identifier and would
+        // fail to parse, which is beside the point of this test.
+        let helper_source: Arc<str> = Arc::from("fn helper() -> f32 { return 1.0; }\n");
+        let overlays = HashMap::from([
+            (a_path, helper_source.clone()),
+            (z_path, helper_source),
+            (user_path.clone(), Arc::<str>::from("fn main() {}\n")),
+        ]);
+
+        let mut winner: Option<String> = None;
+        for _ in 0..20 {
+            let package = PackageIndex::build(root.clone(), &overlays);
+            let completions = package.completions(&user_path, 0);
+            let helper = completions
+                .iter()
+                .find(|completion| completion.label == "helper")
+                .expect("helper is offered as a cross-file completion");
+            let edit = helper
+                .additional_edit
+                .as_ref()
+                .expect("a cross-file symbol carries an auto-import edit")
+                .new_text
+                .clone();
+            match &winner {
+                Some(previous) => assert_eq!(
+                    previous, &edit,
+                    "auto-import target must be stable across independent rebuilds"
+                ),
+                None => winner = Some(edit),
+            }
+        }
+        assert_eq!(winner.as_deref(), Some("import package::a_impl::helper;\n"));
     }
 }
