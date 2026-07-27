@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     fs,
     ops::Range,
@@ -137,10 +138,39 @@ struct LocalSymbol {
     scope_range: Range<usize>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PackageIndex {
     root: PathBuf,
     files: HashMap<PathBuf, FileIndex>,
+    /// Memoized [`TypeEnvironment`] per file, valid for as long as `files` hasn't
+    /// changed shape or content since it was populated. `type_environment` is the only
+    /// reader/writer; `invalidate_type_cache` is the only place that clears it, called
+    /// from every mutation of `files` (`update`, `remove`). `RefCell` is sound here
+    /// because a `PackageIndex` is only ever touched from the single-threaded LSP
+    /// request loop, never shared across threads.
+    type_env_cache: RefCell<HashMap<PathBuf, TypeEnvironment>>,
+}
+
+// `TypeEnvironment` does not implement `Debug`, so this is written by hand rather than
+// derived; the cache is an implementation detail with nothing worth printing.
+impl std::fmt::Debug for PackageIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PackageIndex")
+            .field("root", &self.root)
+            .field("files", &self.files)
+            .finish_non_exhaustive()
+    }
+}
+
+// Thread-local rather than a shared atomic: libtest runs the unit tests of this crate
+// concurrently in one process, and other tests reach `type_environment` too (e.g. any
+// diagnostics test that resolves an import) -- a global counter would let an unrelated
+// test's increment land between the ladder test's own store and load. Each `#[test]`
+// runs on its own OS thread, so a thread-local counter is exact per test with no
+// coordination needed.
+#[cfg(test)]
+thread_local! {
+    static TYPE_ENVIRONMENT_COMPUTATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl PackageIndex {
@@ -164,10 +194,15 @@ impl PackageIndex {
                 files.insert(path.clone(), FileIndex::new(path.clone(), source.clone()));
             }
         }
-        Self { root, files }
+        Self {
+            root,
+            files,
+            type_env_cache: RefCell::new(HashMap::new()),
+        }
     }
 
     pub(crate) fn update(&mut self, path: PathBuf, source: Arc<str>) {
+        self.invalidate_type_cache();
         if parse_str(&dialect::preprocess(&source)).is_err()
             && let Some(existing) = self.files.get_mut(&path)
         {
@@ -455,7 +490,7 @@ impl PackageIndex {
             && (config.type_hints || config.struct_layout_hints)
         {
             let mut active = HashSet::from([path.to_path_buf()]);
-            let imports = self.imported_type_environment(file, &mut active);
+            let (imports, _) = self.imported_type_environment(file, &mut active);
             if config.struct_layout_hints {
                 hints.extend(struct_layout_hints(module, imports.clone(), &range));
             }
@@ -795,7 +830,7 @@ impl PackageIndex {
             }
         }
         let mut active = HashSet::from([path.to_path_buf()]);
-        let imports = self.imported_type_environment(file, &mut active);
+        let (imports, _) = self.imported_type_environment(file, &mut active);
         Some(infer_expression_type(
             module,
             expression,
@@ -884,45 +919,71 @@ impl PackageIndex {
             return crate::check_module(module);
         };
         let mut active = HashSet::from([path.to_path_buf()]);
-        let imports = self.imported_type_environment(file, &mut active);
+        let (imports, _) = self.imported_type_environment(file, &mut active);
         analyze_module(module, imports).0
     }
 
-    fn type_environment(&self, path: &Path, active: &mut HashSet<PathBuf>) -> TypeEnvironment {
-        if !active.insert(path.to_path_buf()) {
-            return TypeEnvironment::default();
+    /// Type environment `path` exports, memoized in `type_env_cache` for the lifetime
+    /// of this index generation. `active` still guards cycles (an import graph can be
+    /// cyclic even though that is itself reported as a diagnostic elsewhere): the
+    /// second element of the return value is `false` when this call's subtree hit a
+    /// cycle truncation, and such a result is deliberately left out of the cache.
+    /// Caching it would freeze a value that only holds for the entry point that
+    /// produced it -- a different caller reaching the same file from a different
+    /// direction around the cycle would get a different (equally arbitrary) answer, so
+    /// memoizing either one would make that other caller's result wrong rather than
+    /// merely order-dependent.
+    fn type_environment(
+        &self,
+        path: &Path,
+        active: &mut HashSet<PathBuf>,
+    ) -> (TypeEnvironment, bool) {
+        if let Some(cached) = self.type_env_cache.borrow().get(path) {
+            return (cached.clone(), true);
         }
-        let environment = self
+        if !active.insert(path.to_path_buf()) {
+            return (TypeEnvironment::default(), false);
+        }
+        #[cfg(test)]
+        TYPE_ENVIRONMENT_COMPUTATIONS.with(|computations| computations.set(computations.get() + 1));
+        let (environment, clean) = self
             .files
             .get(path)
             .and_then(|file| {
                 let module = file.module.as_deref()?;
-                let imports = self.imported_type_environment(file, active);
-                Some(analyze_module(module, imports).1)
+                let (imports, clean) = self.imported_type_environment(file, active);
+                Some((analyze_module(module, imports).1, clean))
             })
-            .unwrap_or_default();
+            .unwrap_or((TypeEnvironment::default(), true));
         active.remove(path);
-        environment
+        if clean {
+            self.type_env_cache
+                .borrow_mut()
+                .insert(path.to_path_buf(), environment.clone());
+        }
+        (environment, clean)
     }
 
     fn imported_type_environment(
         &self,
         file: &FileIndex,
         active: &mut HashSet<PathBuf>,
-    ) -> TypeEnvironment {
+    ) -> (TypeEnvironment, bool) {
         let mut imports = TypeEnvironment::default();
+        let mut clean = true;
         for binding in &file.imports {
             let Some(target_path) = self.module_file(&binding.module) else {
                 continue;
             };
-            let target = self.type_environment(&target_path, active);
+            let (target, target_clean) = self.type_environment(&target_path, active);
+            clean &= target_clean;
             imports.bind_alias(
                 binding.local_name.as_str(),
                 binding.original_name.as_str(),
                 &target,
             );
         }
-        imports
+        (imports, clean)
     }
     pub(crate) fn import_closure(&self, start: &Path) -> Vec<PathBuf> {
         fn visit(
@@ -1077,6 +1138,14 @@ impl PackageIndex {
         }
         path.set_extension("wgsl");
         self.files.contains_key(&path).then_some(path)
+    }
+
+    /// Clears every memoized type environment. Must run before any mutation of `files`
+    /// takes effect: a cached environment reflects the imports of the file it was
+    /// computed for as they stood at that moment, and inserting, updating, or removing
+    /// any file can change what every file that transitively imports it should see.
+    fn invalidate_type_cache(&self) {
+        self.type_env_cache.borrow_mut().clear();
     }
 
     /// A symbol's declaration range, valid against `symbol.path`'s CURRENT text.
@@ -1847,9 +1916,16 @@ fn is_builtin(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        path::PathBuf,
+        sync::Arc,
+    };
 
-    use super::{FileIndex, PackageIndex, declared_type_name, member_base_source};
+    use super::{
+        FileIndex, PackageIndex, TYPE_ENVIRONMENT_COMPUTATIONS, declared_type_name,
+        member_base_source,
+    };
     use crate::ty::{Ty, TypeEnvironment, infer_expression_type};
 
     #[test]
@@ -1983,5 +2059,46 @@ mod tests {
             "the call site itself, and nothing claiming to be the declaration: {references:#?}"
         );
         assert_eq!(&edited[references[0].range.clone()], "helper");
+    }
+
+    #[test]
+    fn type_environment_is_computed_once_per_file_in_a_ladder_dag() {
+        TYPE_ENVIRONMENT_COMPUTATIONS.with(|computations| computations.set(0));
+
+        let root = PathBuf::from("/virtual/ladder");
+        const DEPTH: usize = 9;
+        let mut overlays = HashMap::new();
+        for index in 0..DEPTH {
+            let path = root.join(format!("f{index}.wesl"));
+            let source = if index < 2 {
+                format!("const v{index}: f32 = {index}.0;\n")
+            } else {
+                let a = index - 2;
+                let b = index - 1;
+                format!(
+                    "import package::f{a}::v{a};\nimport package::f{b}::v{b};\nconst v{index}: f32 = v{a} + v{b};\n"
+                )
+            };
+            overlays.insert(path, Arc::<str>::from(source));
+        }
+        let package = PackageIndex::build(root.clone(), &overlays);
+        let last = root.join(format!("f{}.wesl", DEPTH - 1));
+
+        let (_, clean) = package.type_environment(&last, &mut HashSet::new());
+        assert!(clean, "an acyclic ladder DAG has no cycles to truncate");
+        assert_eq!(
+            TYPE_ENVIRONMENT_COMPUTATIONS.with(|computations| computations.get()),
+            DEPTH,
+            "every file in the ladder must be analyzed exactly once, not once per path"
+        );
+
+        // A second request against the same (unmutated) index must reuse the cache
+        // fully instead of recomputing anything.
+        package.type_environment(&last, &mut HashSet::new());
+        assert_eq!(
+            TYPE_ENVIRONMENT_COMPUTATIONS.with(|computations| computations.get()),
+            DEPTH,
+            "a second request must not recompute anything the first one already cached"
+        );
     }
 }
